@@ -156,7 +156,7 @@ function filterItems(items) {
     if (!q) return true;
     return (
       it.name.toLowerCase().includes(q) ||
-      (it.description ?? '').toLowerCase().includes(q)
+      (it.source ?? '').toLowerCase().includes(q)
     );
   });
 }
