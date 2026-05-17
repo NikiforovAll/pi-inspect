@@ -1,0 +1,62 @@
+{
+  "name": "pi-inspect",
+  "version": "0.1.0",
+  "description": "Introspection dashboard for the pi coding agent — tools, slash commands, skills, and the system prompt injected on init.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "inspect",
+    "introspection",
+    "dashboard",
+    "observability"
+  ],
+  "license": "MIT",
+  "author": "nikiforovall",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NikiforovAll/pi-inspect.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NikiforovAll/pi-inspect/issues"
+  },
+  "homepage": "https://github.com/NikiforovAll/pi-inspect#readme",
+  "bin": {
+    "pi-inspect": "./server.js"
+  },
+  "main": "server.js",
+  "files": [
+    "server.js",
+    "lib/",
+    "public/",
+    "extensions/",
+    "themes/",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --open",
+    "typecheck:extensions": "tsc -p extensions/tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "chokidar": "^3.5.3",
+    "express": "^4.19.2",
+    "open": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "typescript": "^5.8.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "image": "https://raw.githubusercontent.com/NikiforovAll/pi-inspect/main/assets/demo.png"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
