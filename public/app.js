@@ -8,8 +8,15 @@ const state = {
   expanded: { context: true, tool: true, command: true, skill: true },
   selected: null,
   expandAll: true,
+  highlight: -1,
+  visibleRows: [],
 };
 const els = {};
+
+function matchKey(e, ...keys) {
+  if (e.ctrlKey || e.altKey || e.metaKey) return false;
+  return keys.some((k) => e.key === k || e.code === k);
+}
 //#endregion
 
 //#region UTIL
@@ -280,10 +287,12 @@ function renderTree() {
   for (const it of items) groups.get(it.kind).push(it);
 
   const html = [];
+  const rows = [];
   for (const kind of KIND_ORDER) {
     const list = groups.get(kind);
     if (!list.length) continue;
     const expanded = state.expanded[kind];
+    rows.push({ type: 'group', key: kind });
     html.push(`
       <div class="tree-row marketplace-row" data-group="${kind}">
         <div class="tree-chevron ${expanded ? 'expanded' : ''}">${chevronSvg()}</div>
@@ -303,9 +312,11 @@ function renderTree() {
       const useSubgroups = bySource.size > 1 && kind !== 'context';
       const sources = useSubgroups
         ? [...bySource.keys()].sort((a, b) => {
-            if (a === 'builtin') return -1;
-            if (b === 'builtin') return 1;
-            return a.localeCompare(b);
+            const rank = (s) => {
+              const i = ['auto', 'builtin'].indexOf(s);
+              return i === -1 ? Infinity : i;
+            };
+            return (rank(a) - rank(b)) || a.localeCompare(b);
           })
         : ['__all__'];
       if (!useSubgroups) bySource.set('__all__', list);
@@ -314,6 +325,7 @@ function renderTree() {
         const subKey = `${kind}::${src}`;
         const subExpanded = state.expanded[subKey] !== false;
         if (useSubgroups) {
+          rows.push({ type: 'subgroup', key: subKey });
           html.push(`
             <div class="tree-row marketplace-row tree-subgroup" data-subgroup="${esc(subKey)}" style="padding-left:24px">
               <div class="tree-chevron ${subExpanded ? 'expanded' : ''}">${chevronSvg()}</div>
@@ -328,6 +340,7 @@ function renderTree() {
           for (const it of sublist) {
             const selected = state.selected === it.id ? 'selected' : '';
             const pad = useSubgroups ? 48 : 32;
+            rows.push({ type: 'item', key: it.id });
             html.push(`
               <div class="tree-row ${selected}" data-item="${esc(it.id)}" style="padding-left:${pad}px">
                 <div class="tree-icon">${iconFor(it.kind)}</div>
@@ -342,6 +355,12 @@ function renderTree() {
     }
   }
   root.innerHTML = html.join('');
+  state.visibleRows = rows;
+  if (state.highlight >= rows.length) state.highlight = rows.length - 1;
+  if (state.highlight >= 0) {
+    const el = root.children[state.highlight];
+    if (el) el.classList.add('focused');
+  }
 
   root.querySelectorAll('.tree-row[data-group]').forEach((el) => {
     el.addEventListener('click', () => {
@@ -360,6 +379,7 @@ function renderTree() {
   root.querySelectorAll('.tree-row[data-item]').forEach((el) => {
     el.addEventListener('click', () => {
       state.selected = el.dataset.item;
+      state.highlight = -1;
       renderTree();
       renderDetail();
     });
@@ -540,6 +560,12 @@ function bindEvents() {
   $('expandToggle').addEventListener('click', () => {
     state.expandAll = !state.expandAll;
     for (const k of KIND_ORDER) state.expanded[k] = state.expandAll;
+    const subKeys = new Set(Object.keys(state.expanded).filter((k) => k.includes('::')));
+    for (const it of buildItems()) subKeys.add(`${it.kind}::${it.source || '(unknown)'}`);
+    for (const key of subKeys) {
+      if (state.expandAll) delete state.expanded[key];
+      else state.expanded[key] = false;
+    }
     $('expandToggle').textContent = state.expandAll ? 'Collapse all' : 'Expand all';
     renderTree();
   });
@@ -551,13 +577,118 @@ function bindEvents() {
     renderDetail();
   });
 
-  window.addEventListener('keydown', (e) => {
-    if (e.target?.tagName === 'INPUT' || e.target?.tagName === 'SELECT') return;
-    if (e.key === '/') { e.preventDefault(); $('searchInput').focus(); }
-    else if (e.key === 'r' || e.key === 'R') $('refreshBtn').click();
-    else if (e.key === 't' || e.key === 'T') $('themeBtn').click();
-    else if (e.key === 'Escape') { state.selected = null; renderTree(); renderDetail(); }
+  window.addEventListener('keydown', handleKeydown);
+
+  document.addEventListener('selectionchange', () => {
+    const sel = document.getSelection();
+    if (!sel || sel.isCollapsed) return;
+    const node = sel.anchorNode;
+    const host = node?.nodeType === 1 ? node : node?.parentElement;
+    const row = host?.closest?.('.tree-row[data-item]');
+    if (!row) return;
+    const id = row.dataset.item;
+    const root = $('treeContainer');
+    const idx = Array.prototype.indexOf.call(root.children, row);
+    if (idx >= 0) state.highlight = idx;
+    if (state.selected !== id) {
+      state.selected = id;
+      renderTree();
+      renderDetail();
+    }
+    row.scrollIntoView({ block: 'nearest' });
   });
+
+  $('shortcutsBtn').addEventListener('click', showHelpModal);
+  $('helpCloseBtn').addEventListener('click', hideHelpModal);
+  $('helpModal').addEventListener('click', (e) => {
+    if (e.target === $('helpModal')) hideHelpModal();
+  });
+}
+
+function moveHighlight(delta) {
+  const rows = state.visibleRows;
+  if (!rows.length) return;
+  const prev = state.highlight;
+  let idx = prev;
+  if (idx < 0) {
+    const selIdx = state.selected ? rows.findIndex((r) => r.type === 'item' && r.key === state.selected) : -1;
+    if (selIdx >= 0) idx = Math.max(0, Math.min(rows.length - 1, selIdx + delta));
+    else idx = delta > 0 ? 0 : rows.length - 1;
+  } else idx = Math.max(0, Math.min(rows.length - 1, idx + delta));
+  if (idx === prev) return;
+  state.highlight = idx;
+  const root = $('treeContainer');
+  if (prev >= 0) root.children[prev]?.classList.remove('focused');
+  const el = root.children[idx];
+  if (el) {
+    el.classList.add('focused');
+    el.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function activateHighlight() {
+  const r = state.visibleRows[state.highlight];
+  if (!r) return;
+  const root = $('treeContainer');
+  const el = root.children[state.highlight];
+  if (el) el.click();
+}
+
+function expandAtHighlight(open) {
+  const r = state.visibleRows[state.highlight];
+  if (!r) return;
+  if (r.type === 'group') {
+    state.expanded[r.key] = open;
+    renderTree();
+  } else if (r.type === 'subgroup') {
+    if (open) delete state.expanded[r.key];
+    else state.expanded[r.key] = false;
+    renderTree();
+  } else if (r.type === 'item' && !open) {
+    for (let i = state.highlight - 1; i >= 0; i--) {
+      if (state.visibleRows[i].type === 'group' || state.visibleRows[i].type === 'subgroup') {
+        state.highlight = i;
+        renderTree();
+        break;
+      }
+    }
+  }
+}
+
+function showHelpModal() { $('helpModal').classList.add('open'); }
+function hideHelpModal() { $('helpModal').classList.remove('open'); }
+function isHelpOpen() { return $('helpModal')?.classList.contains('open'); }
+
+function handleKeydown(e) {
+  if (isHelpOpen()) {
+    if (e.key === 'Escape' || e.key === '?') {
+      e.preventDefault();
+      hideHelpModal();
+    }
+    return;
+  }
+  const tag = e.target?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+    if (e.key === 'Escape') {
+      e.target.blur();
+      e.preventDefault();
+    }
+    return;
+  }
+  if (e.key === '?') { e.preventDefault(); showHelpModal(); return; }
+  if (matchKey(e, '/')) { e.preventDefault(); $('searchInput').focus(); return; }
+  if (matchKey(e, 'f', 'F')) { e.preventDefault(); $('kindFilter').focus(); return; }
+  if (matchKey(e, 'r', 'R')) { e.preventDefault(); $('refreshBtn').click(); return; }
+  if (matchKey(e, 't', 'T')) { e.preventDefault(); $('themeBtn').click(); return; }
+  if (matchKey(e, 'e', 'E')) { e.preventDefault(); $('expandToggle').click(); return; }
+  if (matchKey(e, 'j', 'ArrowDown')) { e.preventDefault(); moveHighlight(1); return; }
+  if (matchKey(e, 'k', 'ArrowUp')) { e.preventDefault(); moveHighlight(-1); return; }
+  if (matchKey(e, 'l', 'ArrowRight')) { e.preventDefault(); expandAtHighlight(true); return; }
+  if (matchKey(e, 'h', 'ArrowLeft')) { e.preventDefault(); expandAtHighlight(false); return; }
+  if (matchKey(e, 'Enter', ' ', 'Space')) { e.preventDefault(); activateHighlight(); return; }
+  if (e.key === 'Escape') {
+    if (state.selected) { state.selected = null; renderTree(); renderDetail(); }
+  }
 }
 
 function bindSse() {

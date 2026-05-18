@@ -45,6 +45,10 @@
     <button class="topbar-btn" id="themeBtn" title="Toggle theme">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
     </button>
+    <button class="topbar-btn" id="shortcutsBtn" title="Keyboard shortcuts (?)">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r="0.5" fill="currentColor"/></svg>
+      <kbd style="font-size:10px">?</kbd>
+    </button>
   </div>
 
   <div class="main-layout">
@@ -64,6 +68,41 @@
   </div>
 
   <div class="toast-container" id="toast"></div>
+
+  <div class="modal-overlay" id="helpModal" aria-hidden="true">
+    <div class="modal help-modal" role="dialog" aria-label="Keyboard shortcuts">
+      <div class="modal-header">
+        <h3>Keyboard Shortcuts</h3>
+        <button class="modal-close" id="helpCloseBtn" title="Close (Esc)">&#10005;</button>
+      </div>
+      <div class="modal-body">
+        <div class="help-sections">
+          <div class="help-section">
+            <h4>Global</h4>
+            <table>
+              <tr><td><kbd>?</kbd></td><td>Show this help</td></tr>
+              <tr><td><kbd>/</kbd></td><td>Focus search</td></tr>
+              <tr><td><kbd>f</kbd></td><td>Focus kind filter</td></tr>
+              <tr><td><kbd>r</kbd></td><td>Refresh</td></tr>
+              <tr><td><kbd>t</kbd></td><td>Toggle theme</td></tr>
+              <tr><td><kbd>e</kbd></td><td>Expand / collapse all</td></tr>
+              <tr><td><kbd>Esc</kbd></td><td>Close modal / clear selection / blur input</td></tr>
+            </table>
+          </div>
+          <div class="help-section">
+            <h4>Navigation</h4>
+            <table>
+              <tr><td><kbd>j</kbd> / <kbd>↓</kbd></td><td>Next row</td></tr>
+              <tr><td><kbd>k</kbd> / <kbd>↑</kbd></td><td>Previous row</td></tr>
+              <tr><td><kbd>l</kbd> / <kbd>→</kbd></td><td>Expand group</td></tr>
+              <tr><td><kbd>h</kbd> / <kbd>←</kbd></td><td>Collapse group / go to parent</td></tr>
+              <tr><td><kbd>Enter</kbd> / <kbd>Space</kbd></td><td>Select / toggle</td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
   <script>
