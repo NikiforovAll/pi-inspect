@@ -1,6 +1,6 @@
 {
   "name": "pi-inspect",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Introspection dashboard for the pi coding agent — tools, slash commands, skills, and the system prompt injected on init.",
   "keywords": [
     "pi-package",
@@ -21,7 +21,7 @@
   },
   "homepage": "https://github.com/NikiforovAll/pi-inspect#readme",
   "bin": {
-    "pi-inspect": "./server.js"
+    "pi-inspect": "server.js"
   },
   "main": "server.js",
   "files": [
@@ -50,10 +50,14 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": { "optional": true }
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "pi": {
-    "extensions": ["./extensions"],
+    "extensions": [
+      "./extensions"
+    ],
     "image": "https://raw.githubusercontent.com/NikiforovAll/pi-inspect/main/assets/demo.png"
   },
   "engines": {
