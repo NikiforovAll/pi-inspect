@@ -7,6 +7,7 @@ const os = require('node:os');
 const chokidar = require('chokidar');
 const open = require('open').default || require('open');
 const snapshots = require('./lib/snapshot');
+const githubSource = require('./lib/github-source');
 const pkg = require('./package.json');
 
 const PORT = Number(process.env.PORT) || 5462;
@@ -39,12 +40,31 @@ app.get('/api/sessions', async (_req, res) => {
   }
 });
 
+const githubMemo = new Map(); // sessionId -> Record<root, {url, source}>
+
+function collectSourceRoots(snap) {
+  const roots = new Set();
+  const add = (x) => {
+    const baseDir = x?.sourceInfo?.baseDir;
+    if (typeof baseDir === 'string' && baseDir) roots.add(baseDir);
+  };
+  for (const t of snap.tools ?? []) add(t);
+  for (const c of snap.commands ?? []) add(c);
+  return [...roots];
+}
+
 app.get('/api/introspect', async (req, res) => {
   try {
     const sid = req.query.session ? String(req.query.session) : null;
     const snap = sid ? await snapshots.readSnapshot(sid) : await snapshots.readLatestSnapshot();
     if (!snap) return res.status(404).json({ error: 'no snapshot found', sessionId: sid });
-    res.json(snap);
+    const memoKey = snap.sessionId;
+    let githubSources = memoKey ? githubMemo.get(memoKey) : null;
+    if (!githubSources) {
+      githubSources = await githubSource.resolveMany(collectSourceRoots(snap));
+      if (memoKey) githubMemo.set(memoKey, githubSources);
+    }
+    res.json({ ...snap, githubSources });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

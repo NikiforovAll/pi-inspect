@@ -99,6 +99,13 @@ function inferPath(x) {
   return p;
 }
 
+function githubUrlFor(it) {
+  const map = state.snapshot?.githubSources;
+  const root = it.raw?.sourceInfo?.baseDir;
+  if (!map || !root) return null;
+  return map[root]?.url || null;
+}
+
 function inferSource(x) {
   const si = x?.sourceInfo;
   if (si) {
@@ -116,12 +123,14 @@ function buildItems() {
   if (!s) return [];
   const items = [];
   for (const t of s.tools ?? []) {
+    const description = t.description ?? '';
     items.push({
       kind: 'tool',
       id: `tool:${t.name}`,
       name: t.name ?? '(tool)',
       source: inferSource(t),
-      description: t.description ?? '',
+      description,
+      chars: description.length,
       active: (s.activeTools ?? []).includes(t.name),
       path: inferPath(t),
       raw: t,
@@ -130,12 +139,14 @@ function buildItems() {
   for (const c of s.commands ?? []) {
     const name = c.name ?? c.command ?? '';
     const isSkill = name.startsWith('skill:');
+    const description = c.description ?? '';
     items.push({
       kind: isSkill ? 'skill' : 'command',
       id: `${isSkill ? 'skill' : 'command'}:${name}`,
       name: `/${name}`,
       source: inferSource(c),
-      description: c.description ?? '',
+      description,
+      chars: description.length,
       path: inferPath(c),
       raw: c,
     });
@@ -148,12 +159,22 @@ function buildItems() {
         name: part.name,
         source: `${part.text.length} chars`,
         description: part.text.slice(0, 240).replace(/\s+/g, ' '),
+        chars: part.text.length,
         path: part.path ?? null,
         raw: { systemPrompt: part.text, path: part.path ?? null },
       });
     }
   }
   return items;
+}
+
+function fmtChars(n) {
+  if (n == null) return '';
+  if (n < 1000) return `${n} chars`;
+  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k chars`;
+}
+function sumChars(list) {
+  return list.reduce((a, b) => a + (b.chars || 0), 0);
 }
 
 function filterItems(items) {
@@ -293,13 +314,14 @@ function renderTree() {
     if (!list.length) continue;
     const expanded = state.expanded[kind];
     rows.push({ type: 'group', key: kind });
+    const groupChars = sumChars(list);
     html.push(`
       <div class="tree-row marketplace-row" data-group="${kind}">
         <div class="tree-chevron ${expanded ? 'expanded' : ''}">${chevronSvg()}</div>
         <div class="tree-icon">${iconFor(kind)}</div>
         <div class="tree-label"><span class="mkt-name">${esc(KIND_LABEL[kind])}</span></div>
         <div class="spacer"></div>
-        <div class="tree-meta">${list.length}</div>
+        <div class="tree-meta">${list.length} · ${fmtChars(groupChars)}</div>
       </div>
     `);
     if (expanded) {
@@ -326,13 +348,14 @@ function renderTree() {
         const subExpanded = state.expanded[subKey] !== false;
         if (useSubgroups) {
           rows.push({ type: 'subgroup', key: subKey });
+          const subChars = sumChars(sublist);
           html.push(`
             <div class="tree-row marketplace-row tree-subgroup" data-subgroup="${esc(subKey)}" style="padding-left:24px">
               <div class="tree-chevron ${subExpanded ? 'expanded' : ''}">${chevronSvg()}</div>
               <div class="tree-icon">${packageSvg()}</div>
               <div class="tree-label"><span class="mkt-name">${esc(src)}</span></div>
               <div class="spacer"></div>
-              <div class="tree-meta">${sublist.length}</div>
+              <div class="tree-meta">${sublist.length} · ${fmtChars(subChars)}</div>
             </div>
           `);
         }
@@ -341,12 +364,15 @@ function renderTree() {
             const selected = state.selected === it.id ? 'selected' : '';
             const pad = useSubgroups ? 48 : 32;
             rows.push({ type: 'item', key: it.id });
+            const meta = it.kind === 'context'
+              ? esc(it.source)
+              : (useSubgroups ? fmtChars(it.chars) : `${esc(it.source)} · ${fmtChars(it.chars)}`);
             html.push(`
               <div class="tree-row ${selected}" data-item="${esc(it.id)}" style="padding-left:${pad}px">
                 <div class="tree-icon">${iconFor(it.kind)}</div>
                 <div class="tree-label">${esc(it.name)}</div>
                 <div class="spacer"></div>
-                <div class="tree-meta">${esc(it.source)}</div>
+                <div class="tree-meta">${meta}</div>
               </div>
             `);
           }
@@ -444,12 +470,14 @@ function renderDetail() {
     `);
   }
 
+  const ghUrl = githubUrlFor(it);
   panel.innerHTML = `
     <div class="detail-header">
       <h3>${iconFor(it.kind)} ${esc(it.name)} <span class="version">${esc(it.kind)}</span></h3>
       <div class="detail-header-actions">
         ${it.path ? `<button class="detail-action" id="openEditorBtn" title="Open in $EDITOR"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></button>` : ''}
         ${it.path ? `<button class="detail-action" id="copyPathBtn" title="Copy path"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button>` : ''}
+        ${ghUrl ? `<button class="detail-action" id="openGithubBtn" title="Open on GitHub"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.96 10.96 0 015.74 0c2.18-1.49 3.14-1.18 3.14-1.18.63 1.59.23 2.76.11 3.05.74.81 1.18 1.84 1.18 3.1 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.68.8.56C20.21 21.38 23.5 17.07 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg></button>` : ''}
         <button class="detail-close" id="detailCloseBtn" title="Close">&#10005;</button>
       </div>
     </div>
@@ -481,6 +509,10 @@ function renderDetail() {
   if (copyBtn) copyBtn.addEventListener('click', async () => {
     try { await navigator.clipboard.writeText(it.path); toast('Path copied'); }
     catch { toast('Copy failed'); }
+  });
+  const ghBtn = $('openGithubBtn');
+  if (ghBtn && ghUrl) ghBtn.addEventListener('click', () => {
+    window.open(ghUrl, '_blank', 'noopener');
   });
 }
 //#endregion
