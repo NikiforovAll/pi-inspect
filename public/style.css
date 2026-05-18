@@ -438,6 +438,17 @@ body {
   flex-shrink: 0;
   white-space: nowrap;
 }
+.tree-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 9 1 0;
+  min-width: 0;
+  opacity: 0.75;
+}
 
 /* === SCOPE TOGGLE BOXES === */
 

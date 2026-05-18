@@ -123,14 +123,14 @@ function buildItems() {
   if (!s) return [];
   const items = [];
   for (const t of s.tools ?? []) {
-    const description = t.description ?? '';
+    const description = (t.description ?? '').replace(/\s+/g, ' ').trim();
     items.push({
       kind: 'tool',
       id: `tool:${t.name}`,
       name: t.name ?? '(tool)',
       source: inferSource(t),
       description,
-      chars: description.length,
+      chars: (t.description ?? '').length,
       active: (s.activeTools ?? []).includes(t.name),
       path: inferPath(t),
       raw: t,
@@ -139,14 +139,14 @@ function buildItems() {
   for (const c of s.commands ?? []) {
     const name = c.name ?? c.command ?? '';
     const isSkill = name.startsWith('skill:');
-    const description = c.description ?? '';
+    const description = (c.description ?? '').replace(/\s+/g, ' ').trim();
     items.push({
       kind: isSkill ? 'skill' : 'command',
       id: `${isSkill ? 'skill' : 'command'}:${name}`,
       name: `/${name}`,
       source: inferSource(c),
       description,
-      chars: description.length,
+      chars: (c.description ?? '').length,
       path: inferPath(c),
       raw: c,
     });
@@ -364,15 +364,15 @@ function renderTree() {
             const selected = state.selected === it.id ? 'selected' : '';
             const pad = useSubgroups ? 48 : 32;
             rows.push({ type: 'item', key: it.id });
-            const meta = it.kind === 'context'
-              ? esc(it.source)
-              : (useSubgroups ? fmtChars(it.chars) : `${esc(it.source)} · ${fmtChars(it.chars)}`);
+            const descHtml = it.description
+              ? `<span class="tree-desc">${esc(it.description)}</span><div class="spacer"></div>`
+              : '<div class="spacer"></div>';
             html.push(`
               <div class="tree-row ${selected}" data-item="${esc(it.id)}" style="padding-left:${pad}px">
                 <div class="tree-icon">${iconFor(it.kind)}</div>
                 <div class="tree-label">${esc(it.name)}</div>
-                <div class="spacer"></div>
-                <div class="tree-meta">${meta}</div>
+                ${descHtml}
+                <div class="tree-meta">${esc(it.source)}</div>
               </div>
             `);
           }
