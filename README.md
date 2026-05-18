@@ -5,7 +5,10 @@
 
 Introspection dashboard for the [pi coding agent](https://pi.dev) — see what's actually loaded into a session: tools, slash commands, skills, and the system prompt injected on init.
 
-![pi-inspect demo](https://raw.githubusercontent.com/NikiforovAll/pi-inspect/main/assets/demo.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NikiforovAll/pi-inspect/main/assets/demo.png" alt="pi-inspect demo" width="49%">
+  <img src="https://raw.githubusercontent.com/NikiforovAll/pi-inspect/main/assets/demo-light.png" alt="pi-inspect demo light" width="49%">
+</p>
 
 ## Installation
 
