@@ -5,7 +5,7 @@ const state = {
   snapshot: null,
   search: '',
   kind: 'all',
-  expanded: { context: true, tool: true, command: true, skill: true },
+  expanded: { context: true, tool: true, command: true, prompt: true, skill: true },
   selected: null,
   expandAll: true,
   highlight: -1,
@@ -147,14 +147,17 @@ function buildItems() {
   for (const c of s.commands ?? []) {
     const name = c.name ?? c.command ?? '';
     const isSkill = name.startsWith('skill:');
+    const src = inferSource(c);
+    const isPrompt = !isSkill && c.source === 'prompt';
+    const kind = isSkill ? 'skill' : isPrompt ? 'prompt' : 'command';
     const description = (c.description ?? '').replace(/\s+/g, ' ').trim();
-    const id = `${isSkill ? 'skill' : 'command'}:${name}`;
+    const id = `${kind}:${name}`;
     activeIds.add(id);
     items.push({
-      kind: isSkill ? 'skill' : 'command',
+      kind,
       id,
       name: `/${name}`,
-      source: inferSource(c),
+      source: src,
       description,
       chars: (c.description ?? '').length,
       path: inferPath(c),
@@ -215,8 +218,8 @@ function filterItems(items) {
   });
 }
 
-const KIND_ORDER = ['context', 'tool', 'command', 'skill'];
-const KIND_LABEL = { context: 'Context', tool: 'Tools', command: 'Commands', skill: 'Skills' };
+const KIND_ORDER = ['context', 'tool', 'command', 'prompt', 'skill'];
+const KIND_LABEL = { context: 'Context', tool: 'Tools', command: 'Commands', prompt: 'Prompts', skill: 'Skills' };
 const SOURCE_RANK = { user: 0, project: 1, auto: 2, builtin: 3 };
 //#endregion
 
@@ -227,6 +230,9 @@ function iconFor(kind) {
   }
   if (kind === 'command') {
     return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`;
+  }
+  if (kind === 'prompt') {
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="13" y2="13"/></svg>`;
   }
   if (kind === 'skill') {
     return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`;
