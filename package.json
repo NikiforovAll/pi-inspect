@@ -1,6 +1,6 @@
 {
   "name": "pi-inspect",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Introspection dashboard for the pi coding agent — tools, slash commands, skills, and the system prompt injected on init.",
   "keywords": [
     "pi-package",
