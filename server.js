@@ -40,6 +40,18 @@ app.get('/api/sessions', async (_req, res) => {
   }
 });
 
+app.post('/api/sessions/cleanup', async (req, res) => {
+  try {
+    const keep = (req.body && req.body.keep) || req.query.keep || null;
+    const result = keep
+      ? await snapshots.keepOnly(String(keep))
+      : await snapshots.cleanupIndex();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 const githubMemo = new Map(); // sessionId -> Record<root, {url, source}>
 
 function collectSourceRoots(snap) {

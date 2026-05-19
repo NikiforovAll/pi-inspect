@@ -368,6 +368,16 @@ body {
 .tree-row.marketplace-row.virtual .tree-icon {
   color: var(--plan);
 }
+.tree-row.disabled .tree-label,
+.tree-row.disabled .tree-desc,
+.tree-row.disabled .tree-icon {
+  opacity: 0.45;
+}
+.tree-row.disabled .tree-meta {
+  color: var(--text-muted, #888);
+  font-style: italic;
+  opacity: 0.8;
+}
 
 .tree-indent {
   flex-shrink: 0;
@@ -433,10 +443,11 @@ body {
 .tree-subgroup .tree-icon { width: 14px; height: 14px; }
 .tree-subgroup .tree-icon svg { width: 14px; height: 14px; }
 .tree-meta {
-  font-size: 10px;
-  color: var(--text-muted);
+  font-size: 11px;
+  color: var(--text, inherit);
   flex-shrink: 0;
   white-space: nowrap;
+  opacity: 0.65;
 }
 .tree-desc {
   font-size: 11px;

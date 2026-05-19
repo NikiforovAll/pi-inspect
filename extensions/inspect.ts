@@ -1,10 +1,10 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { join as joinPath, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 const extDir = fileURLToPath(new URL(".", import.meta.url));
 const port = 5462;
@@ -100,6 +100,161 @@ function writeSnapshot(id: string, snapshot: unknown): void {
 	writeFileSync(joinPath(SNAP_DIR, `${sanitize(id)}.json`), JSON.stringify(snapshot, null, 2), "utf8");
 }
 
+type DisabledKind = "command" | "skill" | "extension" | "theme";
+type DisabledScope = "user" | "project";
+type DisabledItem = {
+	kind: DisabledKind;
+	name: string;
+	displayName: string;
+	description: string;
+	source: string;
+	scope: DisabledScope;
+	settingsPath: string;
+	path: string;
+	reason: string;
+};
+
+const AGENT_DIR = joinPath(homedir(), ".pi", "agent");
+const SETTINGS_PATH = joinPath(AGENT_DIR, "settings.json");
+const NPM_ROOT = joinPath(AGENT_DIR, "npm", "node_modules");
+
+type FilterKind = "prompts" | "skills" | "extensions" | "themes";
+const FILTER_KINDS: readonly FilterKind[] = ["prompts", "skills", "extensions", "themes"];
+
+const KIND_CFG: Record<FilterKind, { kind: DisabledKind; stripExt: RegExp; display: (n: string) => string }> = {
+	prompts:    { kind: "command",   stripExt: /\.md$/i,                  display: (n) => `/${n}` },
+	skills:     { kind: "skill",     stripExt: /\.md$/i,                  display: (n) => `/skill:${n}` },
+	extensions: { kind: "extension", stripExt: /\.(ts|js|mjs|cjs)$/i,     display: (n) => n },
+	themes:     { kind: "theme",     stripExt: /\.(json|toml|ya?ml)$/i,   display: (n) => n },
+};
+
+function resolvePackageRoot(source: string): string | null {
+	if (source.startsWith("npm:")) return joinPath(NPM_ROOT, source.slice(4));
+	let s = source.replace(/\\/g, "/");
+	if (s.startsWith("~/")) s = joinPath(homedir(), s.slice(2));
+	try { return statSync(s).isDirectory() ? s : null; } catch { return null; }
+}
+
+function sourceLabel(source: string): string {
+	if (source.startsWith("npm:")) return source.slice(4);
+	const norm = source.replace(/\\/g, "/").replace(/\/$/, "");
+	return norm.split("/").pop() ?? norm;
+}
+
+const describeCache = new Map<string, { mtimeMs: number; desc: string }>();
+
+function describeFrom(filePath: string, isDir: boolean): string {
+	const path = isDir ? joinPath(filePath, "SKILL.md") : filePath;
+	let mtimeMs: number;
+	try { mtimeMs = statSync(path).mtimeMs; } catch { return ""; }
+	const cached = describeCache.get(path);
+	if (cached && cached.mtimeMs === mtimeMs) return cached.desc;
+	let desc = "";
+	try {
+		const { frontmatter, body } = parseFrontmatter<{ description?: string }>(readFileSync(path, "utf8"));
+		desc = typeof frontmatter.description === "string" && frontmatter.description
+			? frontmatter.description
+			: body.split(/\r?\n/).find((l) => l.trim() && !l.trim().startsWith("#"))?.trim().slice(0, 240) ?? "";
+	} catch {}
+	describeCache.set(path, { mtimeMs, desc });
+	return desc;
+}
+
+function nameFromRel(filterKind: FilterKind, rel: string): string {
+	const base = rel.split("/").pop() ?? rel;
+	if (filterKind === "skills" && /SKILL\.md$/i.test(base)) {
+		const parent = rel.replace(/\/SKILL\.md$/i, "").split("/").pop();
+		return parent ?? base;
+	}
+	return base.replace(KIND_CFG[filterKind].stripExt, "");
+}
+
+type GroupCtx = {
+	root: string;
+	label: string;
+	scope: DisabledScope;
+	settingsPath: string;
+};
+
+function pushDisabled(
+	items: DisabledItem[],
+	filterKind: FilterKind,
+	raw: unknown,
+	ctx: GroupCtx,
+): void {
+	if (typeof raw !== "string" || !raw.startsWith("-")) return;
+	const rel = raw.slice(1).replace(/\\/g, "/");
+	const filePath = joinPath(ctx.root, rel);
+	let isDir = false;
+	try { isDir = statSync(filePath).isDirectory(); } catch { return; }
+	const cfg = KIND_CFG[filterKind];
+	const name = nameFromRel(filterKind, rel);
+	items.push({
+		kind: cfg.kind,
+		name,
+		displayName: cfg.display(name),
+		description: describeFrom(filePath, isDir),
+		source: ctx.label,
+		scope: ctx.scope,
+		settingsPath: ctx.settingsPath,
+		path: filePath,
+		reason: raw,
+	});
+}
+
+function collectGroup(items: DisabledItem[], group: any, ctx: GroupCtx): void {
+	for (const filterKind of FILTER_KINDS) {
+		const arr = group?.[filterKind];
+		if (!Array.isArray(arr)) continue;
+		for (const raw of arr) pushDisabled(items, filterKind, raw, ctx);
+	}
+}
+
+const settingsCache = new Map<string, { mtimeMs: number; items: DisabledItem[] }>();
+
+function readDisabledFrom(
+	settingsPath: string,
+	baseDir: string,
+	scope: DisabledScope,
+): DisabledItem[] {
+	let mtimeMs: number;
+	try { mtimeMs = statSync(settingsPath).mtimeMs; } catch { return []; }
+	const cached = settingsCache.get(settingsPath);
+	if (cached && cached.mtimeMs === mtimeMs) return cached.items;
+
+	let settings: any;
+	try { settings = JSON.parse(readFileSync(settingsPath, "utf8")); } catch { return []; }
+	const items: DisabledItem[] = [];
+
+	collectGroup(items, settings, { root: baseDir, label: scope, scope, settingsPath });
+
+	const packages = Array.isArray(settings?.packages) ? settings.packages : [];
+	for (const entry of packages) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const source = String(entry.source ?? "");
+		if (!source) continue;
+		const root = resolvePackageRoot(source);
+		if (!root) continue;
+		collectGroup(items, entry, { root, label: sourceLabel(source), scope, settingsPath });
+	}
+	settingsCache.set(settingsPath, { mtimeMs, items });
+	return items;
+}
+
+function discoverDisabledFromPackages(cwd: string | null): DisabledItem[] {
+	const scopes: { settings: string; base: string; scope: DisabledScope }[] = [
+		{ settings: SETTINGS_PATH, base: AGENT_DIR, scope: "user" },
+	];
+	if (cwd) scopes.push({ settings: joinPath(cwd, ".pi", "settings.json"), base: joinPath(cwd, ".pi"), scope: "project" });
+
+	// Project overrides user when both disable the same path.
+	const byPath = new Map<string, DisabledItem>();
+	for (const { settings, base, scope } of scopes) {
+		for (const it of readDisabledFrom(settings, base, scope)) byPath.set(it.path, it);
+	}
+	return [...byPath.values()];
+}
+
 function captureSnapshot(ctx: any): { id: string; entry: IndexEntry } | null {
 	const sm = ctx.sessionManager;
 	const id = sm?.getSessionId?.();
@@ -112,8 +267,9 @@ function captureSnapshot(ctx: any): { id: string; entry: IndexEntry } | null {
 	const commands = typeof pi?.getCommands === "function" ? pi.getCommands() : [];
 	const tools = typeof pi?.getAllTools === "function" ? pi.getAllTools() : [];
 	const activeTools = typeof pi?.getActiveTools === "function" ? pi.getActiveTools() : [];
+	const disabledItems = discoverDisabledFromPackages(cwd);
 	const capturedAt = Date.now();
-	const snap = { sessionId: id, sessionName: name, cwd, model, systemPrompt, commands, tools, activeTools, capturedAt };
+	const snap = { sessionId: id, sessionName: name, cwd, model, systemPrompt, commands, tools, activeTools, disabledItems, capturedAt };
 	try {
 		writeSnapshot(id, snap);
 		upsertIndex({ id, cwd, name, model, capturedAt });
