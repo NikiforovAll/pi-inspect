@@ -359,11 +359,16 @@ body {
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
-  z-index: 2;
+  z-index: 3;
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 8px 12px;
+}
+/* Stacks under the group row (top:0); 38px matches .tree-row min-height. */
+.tree-row.marketplace-row.tree-subgroup {
+  top: 38px;
+  z-index: 2;
 }
 .tree-row.marketplace-row.virtual .tree-icon {
   color: var(--plan);
