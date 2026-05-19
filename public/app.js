@@ -110,7 +110,11 @@ function inferSource(x) {
   const si = x?.sourceInfo;
   if (si) {
     if (si.label) return si.label;
-    if (si.source) return si.source.startsWith('npm:') ? si.source.slice(4) : si.source;
+    if (si.source) {
+      const src = si.source.startsWith('npm:') ? si.source.slice(4) : si.source;
+      if (src === 'auto' && si.scope) return si.scope;
+      return src;
+    }
     if (si.origin) return si.origin;
     if (si.kind) return si.kind;
   }
@@ -122,16 +126,20 @@ function buildItems() {
   const s = state.snapshot;
   if (!s) return [];
   const items = [];
+  const activeSet = new Set(s.activeTools ?? []);
+  const activeIds = new Set();
   for (const t of s.tools ?? []) {
     const description = (t.description ?? '').replace(/\s+/g, ' ').trim();
+    const id = `tool:${t.name}`;
+    activeIds.add(id);
     items.push({
       kind: 'tool',
-      id: `tool:${t.name}`,
+      id,
       name: t.name ?? '(tool)',
       source: inferSource(t),
       description,
       chars: (t.description ?? '').length,
-      active: (s.activeTools ?? []).includes(t.name),
+      active: activeSet.has(t.name),
       path: inferPath(t),
       raw: t,
     });
@@ -140,15 +148,33 @@ function buildItems() {
     const name = c.name ?? c.command ?? '';
     const isSkill = name.startsWith('skill:');
     const description = (c.description ?? '').replace(/\s+/g, ' ').trim();
+    const id = `${isSkill ? 'skill' : 'command'}:${name}`;
+    activeIds.add(id);
     items.push({
       kind: isSkill ? 'skill' : 'command',
-      id: `${isSkill ? 'skill' : 'command'}:${name}`,
+      id,
       name: `/${name}`,
       source: inferSource(c),
       description,
       chars: (c.description ?? '').length,
       path: inferPath(c),
       raw: c,
+    });
+  }
+  for (const d of s.disabledItems ?? []) {
+    const id = `${d.kind}:${d.name}`;
+    if (activeIds.has(id)) continue;
+    const description = (d.description ?? '').replace(/\s+/g, ' ').trim();
+    items.push({
+      kind: d.kind,
+      id,
+      name: d.displayName ?? d.name,
+      source: d.source ?? '(package)',
+      description,
+      chars: (d.description ?? '').length,
+      disabled: true,
+      path: d.path ?? null,
+      raw: d,
     });
   }
   if (s.systemPrompt) {
@@ -191,6 +217,7 @@ function filterItems(items) {
 
 const KIND_ORDER = ['context', 'tool', 'command', 'skill'];
 const KIND_LABEL = { context: 'Context', tool: 'Tools', command: 'Commands', skill: 'Skills' };
+const SOURCE_RANK = { user: 0, project: 1, auto: 2, builtin: 3 };
 //#endregion
 
 //#region ICONS
@@ -334,11 +361,9 @@ function renderTree() {
       const useSubgroups = bySource.size > 1 && kind !== 'context';
       const sources = useSubgroups
         ? [...bySource.keys()].sort((a, b) => {
-            const rank = (s) => {
-              const i = ['auto', 'builtin'].indexOf(s);
-              return i === -1 ? Infinity : i;
-            };
-            return (rank(a) - rank(b)) || a.localeCompare(b);
+            const ra = SOURCE_RANK[a] ?? Infinity;
+            const rb = SOURCE_RANK[b] ?? Infinity;
+            return (ra - rb) || a.localeCompare(b);
           })
         : ['__all__'];
       if (!useSubgroups) bySource.set('__all__', list);
@@ -367,8 +392,9 @@ function renderTree() {
             const descHtml = it.description
               ? `<span class="tree-desc">${esc(it.description)}</span><div class="spacer"></div>`
               : '<div class="spacer"></div>';
+            const disabledCls = it.disabled ? ' disabled' : '';
             html.push(`
-              <div class="tree-row ${selected}" data-item="${esc(it.id)}" style="padding-left:${pad}px">
+              <div class="tree-row ${selected}${disabledCls}" data-item="${esc(it.id)}" style="padding-left:${pad}px">
                 <div class="tree-icon">${iconFor(it.kind)}</div>
                 <div class="tree-label">${esc(it.name)}</div>
                 ${descHtml}
@@ -443,6 +469,8 @@ function renderDetail() {
     `);
   }
 
+  const scope = it.raw?.scope;
+  const settingsPath = it.raw?.settingsPath;
   bodySections.push(`
     <div class="detail-section">
       <h4>Metadata</h4>
@@ -450,6 +478,8 @@ function renderDetail() {
         <span class="detail-meta-item">Kind: ${esc(it.kind)}</span>
         <span class="detail-meta-item">Source: ${esc(it.source)}</span>
         ${it.active != null ? `<span class="detail-meta-item">Active: ${it.active ? 'yes' : 'no'}</span>` : ''}
+        ${it.disabled ? `<span class="detail-meta-item">Disabled${scope ? ` (${esc(scope)})` : ''}</span>` : ''}
+        ${settingsPath ? `<span class="detail-meta-item">Settings: ${esc(settingsPath)}</span>` : ''}
       </div>
     </div>
   `);
@@ -580,6 +610,33 @@ function bindEvents() {
     renderDetail();
     setTimeout(() => btn.classList.remove('loading'), 200);
     toast('refreshed');
+  });
+
+  $('cleanupSessionsBtn').addEventListener('click', async () => {
+    const keep = state.currentSessionId;
+    if (!keep) { toast('select a session first'); return; }
+    const others = state.sessions.filter((s) => s.id !== keep).length;
+    if (!others) { toast('only one session — nothing to remove'); return; }
+    if (!confirm(`Delete ${others} other snapshot${others === 1 ? '' : 's'} and keep only the selected session?`)) return;
+    const btn = $('cleanupSessionsBtn');
+    btn.classList.add('loading');
+    try {
+      const r = await fetch('/api/sessions/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keep }),
+      });
+      const data = await r.json();
+      if (!r.ok || data.ok === false) throw new Error(data.error || `HTTP ${r.status}`);
+      const n = data.removed?.length ?? 0;
+      await loadSessions();
+      renderTopbar();
+      toast(n ? `removed ${n} session${n === 1 ? '' : 's'}` : 'nothing to remove');
+    } catch (e) {
+      toast(`cleanup failed: ${e.message}`);
+    } finally {
+      btn.classList.remove('loading');
+    }
   });
 
   $('themeBtn').addEventListener('click', () => {
