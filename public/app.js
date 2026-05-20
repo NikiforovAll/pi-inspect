@@ -360,7 +360,7 @@ function renderTree() {
   const items = filterItems(buildItems());
   if (!state.snapshot) {
     root.innerHTML = state.staticMode
-      ? `<div class="loading">No snapshot in this URL. Open a shared link, or run <code>pi-inspect</code> locally.</div>`
+      ? `<div class="loading">No snapshot in this URL. Open a shared link, or run pi /inspect locally.</div>`
       : `<div class="loading">No snapshot for this session. Run <code>/inspect snapshot</code> in a pi session.</div>`;
     return;
   }
