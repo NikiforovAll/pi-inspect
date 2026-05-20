@@ -284,6 +284,46 @@ function highlightMarkdown(md) {
 }
 
 function splitSystemPrompt(prompt, cwd) {
+  // New XML format
+  const ctxOpen = '<project_context>';
+  const ctxClose = '</project_context>';
+  const ctxStart = prompt.indexOf(ctxOpen);
+  const ctxEnd = ctxStart >= 0 ? prompt.indexOf(ctxClose, ctxStart + ctxOpen.length) : -1;
+
+  if (ctxStart >= 0 && ctxEnd > ctxStart) {
+    const parts = [];
+    parts.push({ id: 'system-prompt', name: 'system prompt', text: prompt.slice(0, ctxStart).trimEnd(), order: 0 });
+
+    const inner = prompt.slice(ctxStart + ctxOpen.length, ctxEnd);
+
+    const instrRe = /<project_instructions\s+path="([^"]+)">\n?([\s\S]*?)\n?<\/project_instructions>/g;
+    let match;
+    let idx = 0;
+    while ((match = instrRe.exec(inner)) !== null) {
+      const fullPath = match[1];
+      const content = match[2].trim();
+      const norm = fullPath.replace(/\\/g, '/').toLowerCase();
+      const isUserScope = /\/\.pi\/agent\//.test(norm) || /\/\.agents\//.test(norm);
+      const cwdNorm = cwd ? String(cwd).replace(/\\/g, '/').toLowerCase() : null;
+      const isProject = !isUserScope && (cwdNorm ? norm.startsWith(cwdNorm) : true);
+      const fileName = fullPath.split(/[\\/]/).pop() || 'memory';
+      parts.push({
+        id: `memory:${idx}`,
+        name: `${isProject ? 'project' : 'user'} · ${fileName}`,
+        text: content,
+        path: fullPath,
+        order: isProject ? 2 : 1,
+      });
+      idx++;
+    }
+
+    if (idx > 0) {
+      parts.sort((a, b) => a.order - b.order);
+      return parts;
+    }
+  }
+
+  // Fall back to old Markdown-based format:
   const re = /\n(##\s+[^\n]*?(?:AGENTS|CLAUDE)\.md)\n/g;
   const hits = [];
   let m;
