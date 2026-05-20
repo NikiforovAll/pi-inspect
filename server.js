@@ -135,6 +135,28 @@ app.post('/api/open', (req, res) => {
   }
 });
 
+const REQ_DIR = path.join(os.homedir(), '.pi', 'agent', 'inspect', 'requests');
+
+app.post('/api/toggle', async (req, res) => {
+  try {
+    const { action, resourceKind, path: target, scope } = req.body || {};
+    if (action !== 'enable' && action !== 'disable') return res.status(400).json({ ok: false, error: 'action must be enable|disable' });
+    if (!['skills', 'prompts', 'extensions', 'themes'].includes(resourceKind)) return res.status(400).json({ ok: false, error: 'invalid resourceKind' });
+    if (!target || typeof target !== 'string') return res.status(400).json({ ok: false, error: 'missing path' });
+    const useScope = scope === 'project' ? 'project' : 'user';
+    await fsp.mkdir(REQ_DIR, { recursive: true });
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const file = path.join(REQ_DIR, `${id}.json`);
+    const tmp = `${file}.tmp`;
+    const body = JSON.stringify({ id, ts: Date.now(), action, resourceKind, path: target, scope: useScope });
+    await fsp.writeFile(tmp, body, 'utf8');
+    await fsp.rename(tmp, file);
+    res.json({ ok: true, id });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/api/focus', (req, res) => {
   const sid = (req.body && req.body.session) || req.query.session || null;
   const count = sseClients.size;

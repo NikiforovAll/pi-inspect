@@ -1,10 +1,31 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	watch as fsWatch,
+	writeFileSync,
+	type FSWatcher,
+} from "node:fs";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
-import { join as joinPath, resolve as resolvePath } from "node:path";
+import {
+	dirname,
+	join as joinPath,
+	relative as relativePath,
+	resolve as resolvePath,
+} from "node:path";
 import { fileURLToPath } from "node:url";
-import { type ExtensionAPI, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import {
+	DefaultPackageManager,
+	type ExtensionAPI,
+	parseFrontmatter,
+	type ResolvedResource,
+	SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 
 const extDir = fileURLToPath(new URL(".", import.meta.url));
 const port = 5462;
@@ -13,6 +34,8 @@ const url = `http://localhost:${port}`;
 const INSPECT_DIR = joinPath(homedir(), ".pi", "agent", "inspect");
 const SNAP_DIR = joinPath(INSPECT_DIR, "snapshots");
 const INDEX_PATH = joinPath(SNAP_DIR, "index.json");
+const REQ_DIR = joinPath(INSPECT_DIR, "requests");
+const REQ_STALE_MS = 60 * 60 * 1000; // 1 hour
 
 let child: ChildProcess | null = null;
 let lastStderr = "";
@@ -100,7 +123,7 @@ function writeSnapshot(id: string, snapshot: unknown): void {
 	writeFileSync(joinPath(SNAP_DIR, `${sanitize(id)}.json`), JSON.stringify(snapshot, null, 2), "utf8");
 }
 
-type DisabledKind = "command" | "skill" | "extension" | "theme";
+type DisabledKind = "command" | "prompt" | "skill" | "extension" | "theme";
 type DisabledScope = "user" | "project";
 type DisabledItem = {
 	kind: DisabledKind;
@@ -112,28 +135,22 @@ type DisabledItem = {
 	settingsPath: string;
 	path: string;
 	reason: string;
+	resourceKind: ResourceKind;
+	baseDir: string;
 };
 
 const AGENT_DIR = joinPath(homedir(), ".pi", "agent");
 const SETTINGS_PATH = joinPath(AGENT_DIR, "settings.json");
-const NPM_ROOT = joinPath(AGENT_DIR, "npm", "node_modules");
 
-type FilterKind = "prompts" | "skills" | "extensions" | "themes";
-const FILTER_KINDS: readonly FilterKind[] = ["prompts", "skills", "extensions", "themes"];
+type ResourceKind = "skills" | "prompts" | "extensions" | "themes";
+const RESOURCE_KINDS: readonly ResourceKind[] = ["skills", "prompts", "extensions", "themes"];
 
-const KIND_CFG: Record<FilterKind, { kind: DisabledKind; stripExt: RegExp; display: (n: string) => string }> = {
-	prompts:    { kind: "command",   stripExt: /\.md$/i,                  display: (n) => `/${n}` },
-	skills:     { kind: "skill",     stripExt: /\.md$/i,                  display: (n) => `/skill:${n}` },
-	extensions: { kind: "extension", stripExt: /\.(ts|js|mjs|cjs)$/i,     display: (n) => n },
-	themes:     { kind: "theme",     stripExt: /\.(json|toml|ya?ml)$/i,   display: (n) => n },
+const KIND_MAP: Record<ResourceKind, { kind: DisabledKind; display: (n: string) => string }> = {
+	prompts:    { kind: "prompt",    display: (n) => `/${n}` },
+	skills:     { kind: "skill",     display: (n) => `/skill:${n}` },
+	extensions: { kind: "extension", display: (n) => n },
+	themes:     { kind: "theme",     display: (n) => n },
 };
-
-function resolvePackageRoot(source: string): string | null {
-	if (source.startsWith("npm:")) return joinPath(NPM_ROOT, source.slice(4));
-	let s = source.replace(/\\/g, "/");
-	if (s.startsWith("~/")) s = joinPath(homedir(), s.slice(2));
-	try { return statSync(s).isDirectory() ? s : null; } catch { return null; }
-}
 
 function sourceLabel(source: string): string {
 	if (source.startsWith("npm:")) return source.slice(4);
@@ -143,8 +160,7 @@ function sourceLabel(source: string): string {
 
 const describeCache = new Map<string, { mtimeMs: number; desc: string }>();
 
-function describeFrom(filePath: string, isDir: boolean): string {
-	const path = isDir ? joinPath(filePath, "SKILL.md") : filePath;
+function describeFromPath(path: string): string {
 	let mtimeMs: number;
 	try { mtimeMs = statSync(path).mtimeMs; } catch { return ""; }
 	const cached = describeCache.get(path);
@@ -160,102 +176,235 @@ function describeFrom(filePath: string, isDir: boolean): string {
 	return desc;
 }
 
-function nameFromRel(filterKind: FilterKind, rel: string): string {
-	const base = rel.split("/").pop() ?? rel;
-	if (filterKind === "skills" && /SKILL\.md$/i.test(base)) {
-		const parent = rel.replace(/\/SKILL\.md$/i, "").split("/").pop();
-		return parent ?? base;
+function nameFromPath(kind: ResourceKind, path: string): string {
+	const norm = path.replace(/\\/g, "/");
+	const base = norm.split("/").pop() ?? norm;
+	if (kind === "skills" && /^SKILL\.md$/i.test(base)) {
+		const parts = norm.split("/");
+		return parts[parts.length - 2] ?? base;
 	}
-	return base.replace(KIND_CFG[filterKind].stripExt, "");
+	return base.replace(/\.(md|ts|js|mjs|cjs|json|toml|ya?ml)$/i, "");
 }
 
-type GroupCtx = {
-	root: string;
-	label: string;
-	scope: DisabledScope;
-	settingsPath: string;
-};
-
-function pushDisabled(
-	items: DisabledItem[],
-	filterKind: FilterKind,
-	raw: unknown,
-	ctx: GroupCtx,
-): void {
-	if (typeof raw !== "string" || !raw.startsWith("-")) return;
-	const rel = raw.slice(1).replace(/\\/g, "/");
-	const filePath = joinPath(ctx.root, rel);
-	let isDir = false;
-	try { isDir = statSync(filePath).isDirectory(); } catch { return; }
-	const cfg = KIND_CFG[filterKind];
-	const name = nameFromRel(filterKind, rel);
-	items.push({
+function buildItemFromResource(
+	kind: ResourceKind,
+	r: ResolvedResource,
+	sessionCwd: string,
+): DisabledItem {
+	const md = r.metadata;
+	const scope: DisabledScope = md.scope === "project" ? "project" : "user";
+	const label = md.origin === "package" ? sourceLabel(md.source) : scope;
+	const name = nameFromPath(kind, r.path);
+	const cfg = KIND_MAP[kind];
+	return {
 		kind: cfg.kind,
 		name,
 		displayName: cfg.display(name),
-		description: describeFrom(filePath, isDir),
-		source: ctx.label,
-		scope: ctx.scope,
-		settingsPath: ctx.settingsPath,
-		path: filePath,
-		reason: raw,
+		description: describeFromPath(r.path),
+		source: label,
+		scope,
+		settingsPath: scope === "project" ? joinPath(sessionCwd, ".pi", "settings.json") : SETTINGS_PATH,
+		path: r.path,
+		reason: md.source,
+		resourceKind: kind,
+		baseDir: md.baseDir ?? AGENT_DIR,
+	};
+}
+
+type ResourceListing = { disabled: DisabledItem[]; pending: DisabledItem[] };
+
+async function discoverFromPackages(
+	cwd: string | null,
+	activePaths: Set<string>,
+): Promise<ResourceListing> {
+	const sessionCwd = cwd ?? process.cwd();
+	const sm = SettingsManager.create(sessionCwd, AGENT_DIR);
+	const pm = new DefaultPackageManager({ cwd: sessionCwd, agentDir: AGENT_DIR, settingsManager: sm });
+	let resolved;
+	try {
+		resolved = await pm.resolve(async () => "skip");
+	} catch (e: any) {
+		console.warn(`pi-inspect: package resolve failed: ${e?.message ?? e}`);
+		return { disabled: [], pending: [] };
+	}
+
+	const disabledByPath = new Map<string, DisabledItem>();
+	const pendingByPath = new Map<string, DisabledItem>();
+	// Pending detection only makes sense for resources with a 1:1 path→command mapping.
+	// Extensions register tools at different paths, themes don't appear as commands at all.
+	const PENDABLE: ReadonlySet<ResourceKind> = new Set(["skills", "prompts"]);
+	for (const kind of RESOURCE_KINDS) {
+		const list = resolved[kind] as ResolvedResource[];
+		for (const r of list) {
+			const item = buildItemFromResource(kind, r, sessionCwd);
+			if (!r.enabled) {
+				disabledByPath.set(r.path, item);
+			} else if (
+				PENDABLE.has(kind) &&
+				!activePaths.has(r.path.replace(/\\/g, "/").toLowerCase())
+			) {
+				// Resolved-enabled but pi's boot-frozen command map doesn't have it yet.
+				pendingByPath.set(r.path, item);
+			}
+		}
+	}
+	return { disabled: [...disabledByPath.values()], pending: [...pendingByPath.values()] };
+}
+
+type ToggleRequest = {
+	id: string;
+	ts: number;
+	action: "enable" | "disable";
+	resourceKind: ResourceKind;
+	path: string;
+	scope: DisabledScope;
+};
+
+function normPath(p: string): string {
+	return resolvePath(p).replace(/\\/g, "/").toLowerCase();
+}
+
+function ensureReqDir(): void {
+	mkdirSync(REQ_DIR, { recursive: true });
+}
+
+function sweepStaleRequests(): void {
+	let entries: string[];
+	try { entries = readdirSync(REQ_DIR); } catch { return; }
+	const now = Date.now();
+	for (const f of entries) {
+		const full = joinPath(REQ_DIR, f);
+		try {
+			const st = statSync(full);
+			if (now - st.mtimeMs > REQ_STALE_MS) unlinkSync(full);
+		} catch {}
+	}
+}
+
+// Mirrors the toggle logic in pi-coding-agent's ConfigSelectorComponent
+// (modes/interactive/components/config-selector.js). Strips any existing
+// `+`/`-`/`!` entries for the pattern, then appends the new one.
+function applyPattern(arr: string[], pattern: string, enabled: boolean): string[] {
+	const filtered = arr.filter((p) => {
+		const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
+		return stripped !== pattern;
 	});
+	filtered.push(enabled ? `+${pattern}` : `-${pattern}`);
+	return filtered;
 }
 
-function collectGroup(items: DisabledItem[], group: any, ctx: GroupCtx): void {
-	for (const filterKind of FILTER_KINDS) {
-		const arr = group?.[filterKind];
-		if (!Array.isArray(arr)) continue;
-		for (const raw of arr) pushDisabled(items, filterKind, raw, ctx);
+async function processToggleRequest(req: ToggleRequest, sessionCwd: string): Promise<void> {
+	const sm = SettingsManager.create(sessionCwd, AGENT_DIR);
+	const pm = new DefaultPackageManager({ cwd: sessionCwd, agentDir: AGENT_DIR, settingsManager: sm });
+	const resolved = await pm.resolve(async () => "skip");
+	const list = resolved[req.resourceKind] as ResolvedResource[];
+	const target = list.find((r) => normPath(r.path) === normPath(req.path));
+	if (!target) throw new Error(`resource not in resolution: ${req.path}`);
+	const md = target.metadata;
+	const enabled = req.action === "enable";
+	const scope: DisabledScope = md.scope === "project" ? "project" : "user";
+
+	if (md.origin === "package") {
+		const baseDir = md.baseDir ?? dirname(target.path);
+		const pattern = relativePath(baseDir, target.path);
+		const settings = scope === "project" ? sm.getProjectSettings() : sm.getGlobalSettings();
+		const packages = [...(settings.packages ?? [])];
+		const idx = packages.findIndex((p) => (typeof p === "string" ? p : p.source) === md.source);
+		if (idx < 0) throw new Error(`package not found in settings: ${md.source}`);
+		let pkg = packages[idx];
+		if (typeof pkg === "string") {
+			pkg = { source: pkg };
+			packages[idx] = pkg;
+		}
+		const arrayKey = req.resourceKind as keyof typeof pkg & ("extensions" | "skills" | "prompts" | "themes");
+		const current = ((pkg as any)[arrayKey] as string[] | undefined) ?? [];
+		const updated = applyPattern(current, pattern, enabled);
+		(pkg as any)[arrayKey] = updated.length > 0 ? updated : undefined;
+		const hasFilters = (["extensions", "skills", "prompts", "themes"] as const).some(
+			(k) => (pkg as any)[k] !== undefined,
+		);
+		if (!hasFilters) packages[idx] = (pkg as any).source;
+		if (scope === "project") sm.setProjectPackages(packages);
+		else sm.setPackages(packages);
+		await sm.flush();
+		return;
+	}
+
+	// top-level
+	const baseDir = scope === "project" ? joinPath(sessionCwd, ".pi") : AGENT_DIR;
+	const pattern = relativePath(baseDir, target.path);
+	const settings = scope === "project" ? sm.getProjectSettings() : sm.getGlobalSettings();
+	const current = ((settings as any)[req.resourceKind] as string[] | undefined) ?? [];
+	const updated = applyPattern(current, pattern, enabled);
+	const setters: Record<ResourceKind, { user: string; project: string }> = {
+		skills:     { user: "setSkillPaths",          project: "setProjectSkillPaths" },
+		prompts:    { user: "setPromptTemplatePaths", project: "setProjectPromptTemplatePaths" },
+		extensions: { user: "setExtensionPaths",      project: "setProjectExtensionPaths" },
+		themes:     { user: "setThemePaths",          project: "setProjectThemePaths" },
+	};
+	(sm as any)[setters[req.resourceKind][scope]](updated);
+	await sm.flush();
+}
+
+let lastCtx: any = null;
+let reqWatcher: FSWatcher | null = null;
+const recentlyHandled = new Set<string>();
+
+async function handleRequestFile(full: string): Promise<void> {
+	if (recentlyHandled.has(full)) return;
+	recentlyHandled.add(full);
+	setTimeout(() => recentlyHandled.delete(full), 5000);
+
+	let raw: string;
+	try { raw = readFileSync(full, "utf8"); } catch { return; }
+	if (!raw.trim()) return;
+	let req: ToggleRequest;
+	try { req = JSON.parse(raw) as ToggleRequest; } catch (e: any) {
+		console.warn(`pi-inspect: bad request file ${full}: ${e?.message ?? e}`);
+		try { renameSync(full, `${full}.err.json`); } catch {}
+		return;
+	}
+
+	const cwd = lastCtx?.sessionManager?.getCwd?.() ?? process.cwd();
+	try {
+		await processToggleRequest(req, cwd);
+		try { unlinkSync(full); } catch {}
+		if (lastCtx) await captureSnapshot(lastCtx);
+	} catch (e: any) {
+		console.warn(`pi-inspect: toggle failed: ${e?.message ?? e}`);
+		try {
+			writeFileSync(`${full}.err.json`, JSON.stringify({ error: e?.message ?? String(e), req }, null, 2));
+			unlinkSync(full);
+		} catch {}
 	}
 }
 
-const settingsCache = new Map<string, { mtimeMs: number; items: DisabledItem[] }>();
-
-function readDisabledFrom(
-	settingsPath: string,
-	baseDir: string,
-	scope: DisabledScope,
-): DisabledItem[] {
-	let mtimeMs: number;
-	try { mtimeMs = statSync(settingsPath).mtimeMs; } catch { return []; }
-	const cached = settingsCache.get(settingsPath);
-	if (cached && cached.mtimeMs === mtimeMs) return cached.items;
-
-	let settings: any;
-	try { settings = JSON.parse(readFileSync(settingsPath, "utf8")); } catch { return []; }
-	const items: DisabledItem[] = [];
-
-	collectGroup(items, settings, { root: baseDir, label: scope, scope, settingsPath });
-
-	const packages = Array.isArray(settings?.packages) ? settings.packages : [];
-	for (const entry of packages) {
-		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-		const source = String(entry.source ?? "");
-		if (!source) continue;
-		const root = resolvePackageRoot(source);
-		if (!root) continue;
-		collectGroup(items, entry, { root, label: sourceLabel(source), scope, settingsPath });
+function setupRequestWatcher(): void {
+	ensureReqDir();
+	sweepStaleRequests();
+	// Drain orphans at startup
+	try {
+		for (const f of readdirSync(REQ_DIR)) {
+			if (f.endsWith(".err.json") || !f.endsWith(".json")) continue;
+			void handleRequestFile(joinPath(REQ_DIR, f));
+		}
+	} catch {}
+	if (reqWatcher) return;
+	try {
+		reqWatcher = fsWatch(REQ_DIR, (_event, filename) => {
+			if (!filename) return;
+			const name = String(filename);
+			if (!name.endsWith(".json") || name.endsWith(".err.json")) return;
+			const full = joinPath(REQ_DIR, name);
+			try { statSync(full); } catch { return; }
+			void handleRequestFile(full);
+		});
+	} catch (e: any) {
+		console.warn(`pi-inspect: request watcher failed: ${e?.message ?? e}`);
 	}
-	settingsCache.set(settingsPath, { mtimeMs, items });
-	return items;
 }
 
-function discoverDisabledFromPackages(cwd: string | null): DisabledItem[] {
-	const scopes: { settings: string; base: string; scope: DisabledScope }[] = [
-		{ settings: SETTINGS_PATH, base: AGENT_DIR, scope: "user" },
-	];
-	if (cwd) scopes.push({ settings: joinPath(cwd, ".pi", "settings.json"), base: joinPath(cwd, ".pi"), scope: "project" });
-
-	// Project overrides user when both disable the same path.
-	const byPath = new Map<string, DisabledItem>();
-	for (const { settings, base, scope } of scopes) {
-		for (const it of readDisabledFrom(settings, base, scope)) byPath.set(it.path, it);
-	}
-	return [...byPath.values()];
-}
-
-function captureSnapshot(ctx: any): { id: string; entry: IndexEntry } | null {
+async function captureSnapshot(ctx: any): Promise<{ id: string; entry: IndexEntry } | null> {
 	const sm = ctx.sessionManager;
 	const id = sm?.getSessionId?.();
 	if (!id) return null;
@@ -267,9 +416,18 @@ function captureSnapshot(ctx: any): { id: string; entry: IndexEntry } | null {
 	const commands = typeof pi?.getCommands === "function" ? pi.getCommands() : [];
 	const tools = typeof pi?.getAllTools === "function" ? pi.getAllTools() : [];
 	const activeTools = typeof pi?.getActiveTools === "function" ? pi.getActiveTools() : [];
-	const disabledItems = discoverDisabledFromPackages(cwd);
+	const activePaths = new Set<string>();
+	for (const c of commands) {
+		const p = c?.sourceInfo?.path;
+		if (typeof p === "string") activePaths.add(p.replace(/\\/g, "/").toLowerCase());
+	}
+	for (const t of tools) {
+		const p = t?.sourceInfo?.path;
+		if (typeof p === "string") activePaths.add(p.replace(/\\/g, "/").toLowerCase());
+	}
+	const { disabled: disabledItems, pending: pendingItems } = await discoverFromPackages(cwd, activePaths);
 	const capturedAt = Date.now();
-	const snap = { sessionId: id, sessionName: name, cwd, model, systemPrompt, commands, tools, activeTools, disabledItems, capturedAt };
+	const snap = { sessionId: id, sessionName: name, cwd, model, systemPrompt, commands, tools, activeTools, disabledItems, pendingItems, capturedAt };
 	try {
 		writeSnapshot(id, snap);
 		upsertIndex({ id, cwd, name, model, capturedAt });
@@ -339,13 +497,16 @@ function showHelp(notify: (m: string, l?: "info" | "error") => void) {
 
 export default function inspectExtension(pi: ExtensionAPI) {
 	piRef = pi;
+	setupRequestWatcher();
 	pi.on("session_start", async (_event, ctx) => {
-		captureSnapshot(ctx);
+		lastCtx = ctx;
+		await captureSnapshot(ctx);
 	});
 	// session_start fires before all extensions register their tools/commands.
 	// before_agent_start fires after the user's first prompt with the fully assembled state — re-capture then.
 	pi.on("before_agent_start", async (_event, ctx) => {
-		captureSnapshot(ctx);
+		lastCtx = ctx;
+		await captureSnapshot(ctx);
 	});
 
 	pi.registerCommand("inspect", {
@@ -363,6 +524,7 @@ export default function inspectExtension(pi: ExtensionAPI) {
 			return SUBCOMMANDS.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s }));
 		},
 		handler: async (args, ctx) => {
+			lastCtx = ctx;
 			const notify = (m: string, l: "info" | "error" = "info") => ctx.ui.notify(m, l);
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
 			const first = tokens[0] as Sub | string | undefined;
@@ -382,7 +544,7 @@ export default function inspectExtension(pi: ExtensionAPI) {
 
 			if (first === "start") {
 				if (!(await startServer(notify))) return;
-				captureSnapshot(ctx);
+				await captureSnapshot(ctx);
 				notify(`pi-inspect started → ${url}`);
 				return;
 			}
@@ -407,7 +569,7 @@ export default function inspectExtension(pi: ExtensionAPI) {
 			}
 
 			if (first === "snapshot") {
-				const r = captureSnapshot(ctx);
+				const r = await captureSnapshot(ctx);
 				notify(r ? `snapshot captured: ${r.id}` : "no active session to snapshot", r ? "info" : "error");
 				return;
 			}
@@ -417,7 +579,7 @@ export default function inspectExtension(pi: ExtensionAPI) {
 			const openTarget = (isExplicitOpen ? (tokens[1] ?? "web") : "web") as "web" | "app";
 
 			if (!(await startServer(notify))) return;
-			captureSnapshot(ctx);
+			await captureSnapshot(ctx);
 
 			let openId: string | null = null;
 			if (!isExplicitOpen && first && !(SUBCOMMANDS as readonly string[]).includes(first)) {
