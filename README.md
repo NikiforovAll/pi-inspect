@@ -31,6 +31,14 @@ Then use `/inspect start | stop | restart | status | open | list | snapshot` fro
 
 State is driven entirely through the `?session=` URL param — share or refresh URLs to pin views. The in-page picker also writes to the URL.
 
+## Sharing a snapshot
+
+Click **Share** in the topbar to copy a self-contained link of the current snapshot. The snapshot is `deflate-raw` compressed and base64url-encoded into the URL hash (`#s=…`) — no server, no upload, no account.
+
+Recipients open the link on the hosted static dashboard at **https://nikiforovall.blog/pi-inspect/** and see the exact same tools / commands / skills / system prompt. The page makes no network requests; everything is in the URL.
+
+Heads up: the link includes the system prompt and `cwd`. Don't share secrets you wouldn't paste in chat.
+
 ## What it captures
 
 - **Tools** — name, description, parameter schema, source

@@ -10,6 +10,7 @@ const state = {
   expandAll: true,
   highlight: -1,
   visibleRows: [],
+  staticMode: false,
 };
 const els = {};
 
@@ -358,7 +359,9 @@ function renderTree() {
   const root = $('treeContainer');
   const items = filterItems(buildItems());
   if (!state.snapshot) {
-    root.innerHTML = `<div class="loading">No snapshot for this session. Run <code>/inspect snapshot</code> in a pi session.</div>`;
+    root.innerHTML = state.staticMode
+      ? `<div class="loading">No snapshot in this URL. Open a shared link, or run <code>pi-inspect</code> locally.</div>`
+      : `<div class="loading">No snapshot for this session. Run <code>/inspect snapshot</code> in a pi session.</div>`;
     return;
   }
   if (!items.length) {
@@ -542,12 +545,13 @@ function renderDetail() {
 
   const ghUrl = githubUrlFor(it);
   const toggleInfo = toggleInfoFor(it);
+  const allowEditor = !state.staticMode && it.path;
   panel.innerHTML = `
     <div class="detail-header">
       <h3>${iconFor(it.kind)} ${esc(it.name)} <span class="version">${esc(it.kind)}</span></h3>
       <div class="detail-header-actions">
         ${toggleInfo ? `<button class="detail-action" id="toggleBtn" title="${toggleInfo.enable ? 'Enable' : 'Disable'} (${toggleInfo.scope})">${toggleInfo.enable ? 'Enable' : 'Disable'}</button>` : ''}
-        ${it.path ? `<button class="detail-action" id="openEditorBtn" title="Open in $EDITOR"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></button>` : ''}
+        ${allowEditor ? `<button class="detail-action" id="openEditorBtn" title="Open in $EDITOR"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></button>` : ''}
         ${it.path ? `<button class="detail-action" id="copyPathBtn" title="Copy path"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button>` : ''}
         ${ghUrl ? `<button class="detail-action" id="openGithubBtn" title="Open on GitHub"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.96 10.96 0 015.74 0c2.18-1.49 3.14-1.18 3.14-1.18.63 1.59.23 2.76.11 3.05.74.81 1.18 1.84 1.18 3.1 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.68.8.56C20.21 21.38 23.5 17.07 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg></button>` : ''}
         <button class="detail-close" id="detailCloseBtn" title="Close">&#10005;</button>
@@ -588,6 +592,7 @@ function renderDetail() {
   });
   const toggleBtn = $('toggleBtn');
   if (toggleBtn && toggleInfo) toggleBtn.addEventListener('click', async () => {
+    if (state.staticMode) { toast('shared view is read-only — run pi-inspect locally to toggle'); return; }
     toggleBtn.disabled = true;
     try {
       const r = await fetch('/api/toggle', {
@@ -675,6 +680,24 @@ function bindEvents() {
   $('searchInput').addEventListener('input', (e) => {
     state.search = e.target.value;
     renderTree();
+  });
+
+  $('shareBtn').addEventListener('click', async () => {
+    if (!state.snapshot) { toast('no snapshot to share'); return; }
+    if (!window.piShare) { toast('share module not loaded'); return; }
+    const btn = $('shareBtn');
+    btn.classList.add('loading');
+    try {
+      const encoded = await window.piShare.encodeSnapshot(state.snapshot);
+      const url = window.piShare.buildShareUrl(encoded);
+      await navigator.clipboard.writeText(url);
+      const kb = Math.max(1, Math.round(url.length / 1024));
+      toast(`Share link copied — ${kb} KB. Paths redacted to <home>.`);
+    } catch (e) {
+      toast(`Share failed: ${e.message}`);
+    } finally {
+      btn.classList.remove('loading');
+    }
   });
 
   $('refreshBtn').addEventListener('click', async () => {
@@ -887,6 +910,34 @@ function bindSse() {
 //#endregion
 
 //#region INIT
+async function loadSharedSnapshot() {
+  const param = window.piShare?.getSharedSnapshotParam();
+  if (!param) return false;
+  try {
+    state.snapshot = await window.piShare.decodeSnapshot(param);
+    state.currentSessionId = state.snapshot?.sessionId ?? null;
+    state.sessions = state.currentSessionId
+      ? [{ id: state.currentSessionId, name: state.snapshot.sessionName, cwd: state.snapshot.cwd }]
+      : [];
+    state.staticMode = true;
+    return true;
+  } catch (e) {
+    console.warn('Failed to decode shared snapshot:', e);
+    toast(`shared link decode failed: ${e.message}`, 'error');
+    return false;
+  }
+}
+
+function applyStaticModeUi() {
+  document.body.classList.add('static-mode');
+  for (const id of ['sessionSelect', 'cleanupSessionsBtn', 'refreshBtn']) {
+    const el = $(id);
+    if (el) el.style.display = 'none';
+  }
+  const share = $('shareBtn');
+  if (share) share.title = 'Re-copy this shared snapshot link';
+}
+
 (async function init() {
   try {
     if (localStorage.getItem('inspect.theme') === 'light') document.body.classList.add('light');
@@ -895,10 +946,20 @@ function bindSse() {
   bindResize();
   bindEvents();
 
-  await loadSessions();
-  const requested = getUrlSession();
-  await loadSnapshot(requested);
-  if (state.currentSessionId && !requested) setUrlSession(state.currentSessionId, true);
+  const sharedLoaded = await loadSharedSnapshot();
+  if (!sharedLoaded) {
+    try {
+      await loadSessions();
+      const requested = getUrlSession();
+      await loadSnapshot(requested);
+      if (state.currentSessionId && !requested) setUrlSession(state.currentSessionId, true);
+    } catch {
+      state.staticMode = true;
+      state.snapshot = null;
+    }
+  }
+
+  if (state.staticMode) applyStaticModeUi();
 
   if (state.snapshot?.systemPrompt) {
     const firstCtx = buildItems().find((x) => x.kind === 'context');
@@ -908,6 +969,6 @@ function bindSse() {
   renderTopbar();
   renderTree();
   renderDetail();
-  bindSse();
+  if (!state.staticMode) bindSse();
 })();
 //#endregion

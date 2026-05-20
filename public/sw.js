@@ -1,6 +1,8 @@
 // pi-inspect service worker — network-first for dynamic data, cache-first for static shell.
-const VERSION = 'pi-inspect-v1';
-const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/manifest.webmanifest', '/icon.svg'];
+const VERSION = 'pi-inspect-v6';
+// Resolve relative to the SW scope so this works under any subpath (e.g. GitHub Pages).
+const BASE = new URL('./', self.registration?.scope || self.location.href).pathname;
+const SHELL = ['', 'index.html', 'style.css', 'app.js', 'share.js', 'manifest.webmanifest', 'icon.svg'].map((p) => BASE + p);
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).catch(() => {}));
