@@ -13,6 +13,13 @@ const state = {
   staticMode: false,
 };
 const els = {};
+const launchParams = new URLSearchParams(location.search);
+const apiToken = launchParams.get('token') || '';
+if (launchParams.has('token')) {
+  const clean = new URL(location.href);
+  clean.searchParams.delete('token');
+  history.replaceState(null, '', clean);
+}
 
 function matchKey(e, ...keys) {
   if (e.ctrlKey || e.altKey || e.metaKey) return false;
@@ -70,8 +77,12 @@ function toast(msg, kind = 'info') {
 //#endregion
 
 //#region FETCH
+function authHeaders(headers = {}) {
+  return { ...headers, authorization: `Bearer ${apiToken}` };
+}
+
 async function fetchJson(path) {
-  const r = await fetch(path);
+  const r = await fetch(path, { headers: authHeaders() });
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
   return r.json();
 }
@@ -569,7 +580,7 @@ function renderDetail() {
     try {
       const r = await fetch('/api/open', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({ path: it.path }),
       });
       const ct = r.headers.get('content-type') || '';
@@ -597,12 +608,13 @@ function renderDetail() {
     try {
       const r = await fetch('/api/toggle', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({
           action: toggleInfo.enable ? 'enable' : 'disable',
           resourceKind: toggleInfo.resourceKind,
           path: toggleInfo.path,
           scope: toggleInfo.scope,
+          sessionId: state.currentSessionId,
         }),
       });
       const j = await r.json();
@@ -723,7 +735,7 @@ function bindEvents() {
     try {
       const r = await fetch('/api/sessions/cleanup', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ keep }),
       });
       const data = await r.json();
@@ -881,7 +893,7 @@ function handleKeydown(e) {
 }
 
 function bindSse() {
-  const es = new EventSource('/api/events');
+  const es = new EventSource(`/api/events?token=${encodeURIComponent(apiToken)}`);
   es.addEventListener('snapshot', async () => {
     await loadSessions();
     await loadSnapshot(state.currentSessionId);

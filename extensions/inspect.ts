@@ -1,9 +1,13 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
+	chmodSync,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
+	rmSync,
 	statSync,
 	unlinkSync,
 	watch as fsWatch,
@@ -11,7 +15,7 @@ import {
 	type FSWatcher,
 } from "node:fs";
 import { createConnection } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
 	dirname,
 	join as joinPath,
@@ -28,18 +32,53 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const extDir = fileURLToPath(new URL(".", import.meta.url));
-const port = 5462;
+const configuredPort = Number(process.env.PORT);
+const port = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort < 65536 ? configuredPort : 5462;
 const url = `http://localhost:${port}`;
 
-const INSPECT_DIR = joinPath(homedir(), ".pi", "agent", "inspect");
+const INSPECT_DIR = process.env.INSPECT_STATE_DIR
+	?? joinPath(tmpdir(), `pi-inspect-${process.getuid?.() ?? "user"}`);
 const SNAP_DIR = joinPath(INSPECT_DIR, "snapshots");
 const INDEX_PATH = joinPath(SNAP_DIR, "index.json");
-const REQ_DIR = joinPath(INSPECT_DIR, "requests");
+const REQ_ROOT = joinPath(INSPECT_DIR, "requests");
+const SERVER_PATH = joinPath(INSPECT_DIR, "server.json");
+const CAPABILITY_PATH = joinPath(INSPECT_DIR, "capability");
 const REQ_STALE_MS = 60 * 60 * 1000; // 1 hour
 
 let child: ChildProcess | null = null;
 let lastStderr = "";
 let piRef: ExtensionAPI | null = null;
+
+function loadCapability(): string {
+	try {
+		mkdirSync(INSPECT_DIR, { recursive: true, mode: 0o700 });
+		chmodSync(INSPECT_DIR, 0o700);
+		const existing = readFileSync(CAPABILITY_PATH, "utf8").trim();
+		chmodSync(CAPABILITY_PATH, 0o600);
+		if (existing) return existing;
+	} catch {}
+	const value = randomBytes(32).toString("hex");
+	mkdirSync(INSPECT_DIR, { recursive: true, mode: 0o700 });
+	chmodSync(INSPECT_DIR, 0o700);
+	writeFileSync(CAPABILITY_PATH, value, { encoding: "utf8", mode: 0o600 });
+	chmodSync(CAPABILITY_PATH, 0o600);
+	return value;
+}
+
+function secureStateTree(path: string): void {
+	let stat;
+	try { stat = lstatSync(path); } catch { return; }
+	if (stat.isSymbolicLink()) return;
+	if (stat.isDirectory()) {
+		chmodSync(path, 0o700);
+		for (const entry of readdirSync(path)) secureStateTree(joinPath(path, entry));
+		return;
+	}
+	if (stat.isFile()) chmodSync(path, 0o600);
+}
+
+const capability = loadCapability();
+secureStateTree(INSPECT_DIR);
 
 function probePort(p: number, timeoutMs = 250): Promise<boolean> {
 	return new Promise((resolve) => {
@@ -59,30 +98,6 @@ async function waitForPort(p: number, totalMs = 5000): Promise<boolean> {
 		await new Promise((r) => setTimeout(r, 150));
 	}
 	return false;
-}
-
-function findPidsOnPort(p: number): number[] {
-	if (process.platform === "win32") {
-		const r = spawnSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8" });
-		if (r.status !== 0) return [];
-		const pids = new Set<number>();
-		for (const line of r.stdout.split(/\r?\n/)) {
-			const m = line.match(/^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
-			if (m && Number(m[1]) === p) pids.add(Number(m[2]));
-		}
-		return [...pids];
-	}
-	const r = spawnSync("lsof", ["-tiTCP:" + p, "-sTCP:LISTEN"], { encoding: "utf8" });
-	if (r.status !== 0) return [];
-	return r.stdout.split(/\s+/).map(Number).filter((n) => Number.isFinite(n) && n > 0);
-}
-
-function killPid(pid: number): void {
-	if (process.platform === "win32") {
-		spawnSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore" });
-	} else {
-		try { process.kill(pid, "SIGKILL"); } catch {}
-	}
 }
 
 function sanitize(id: string): string {
@@ -107,9 +122,16 @@ function readIndex(): IndexEntry[] {
 	}
 }
 
+function writePrivateJson(path: string, value: unknown): void {
+	const parent = dirname(path);
+	mkdirSync(parent, { recursive: true, mode: 0o700 });
+	chmodSync(parent, 0o700);
+	writeFileSync(path, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
+	chmodSync(path, 0o600);
+}
+
 function writeIndex(entries: IndexEntry[]): void {
-	mkdirSync(SNAP_DIR, { recursive: true });
-	writeFileSync(INDEX_PATH, JSON.stringify({ sessions: entries }, null, 2), "utf8");
+	writePrivateJson(INDEX_PATH, { sessions: entries });
 }
 
 function upsertIndex(entry: IndexEntry): void {
@@ -118,9 +140,12 @@ function upsertIndex(entry: IndexEntry): void {
 	writeIndex(list);
 }
 
+function removeIndexEntry(id: string): void {
+	writeIndex(readIndex().filter((entry) => entry.id !== id));
+}
+
 function writeSnapshot(id: string, snapshot: unknown): void {
-	mkdirSync(SNAP_DIR, { recursive: true });
-	writeFileSync(joinPath(SNAP_DIR, `${sanitize(id)}.json`), JSON.stringify(snapshot, null, 2), "utf8");
+	writePrivateJson(joinPath(SNAP_DIR, `${sanitize(id)}.json`), snapshot);
 }
 
 type DisabledKind = "command" | "prompt" | "skill" | "extension" | "theme";
@@ -253,6 +278,7 @@ async function discoverFromPackages(
 
 type ToggleRequest = {
 	id: string;
+	sessionId: string;
 	ts: number;
 	action: "enable" | "disable";
 	resourceKind: ResourceKind;
@@ -264,16 +290,21 @@ function normPath(p: string): string {
 	return resolvePath(p).replace(/\\/g, "/").toLowerCase();
 }
 
-function ensureReqDir(): void {
-	mkdirSync(REQ_DIR, { recursive: true });
+function requestDir(sessionId: string): string {
+	return joinPath(REQ_ROOT, sanitize(sessionId));
 }
 
-function sweepStaleRequests(): void {
+function ensureReqDir(path: string): void {
+	mkdirSync(path, { recursive: true, mode: 0o700 });
+	chmodSync(path, 0o700);
+}
+
+function sweepStaleRequests(path: string): void {
 	let entries: string[];
-	try { entries = readdirSync(REQ_DIR); } catch { return; }
+	try { entries = readdirSync(path); } catch { return; }
 	const now = Date.now();
 	for (const f of entries) {
-		const full = joinPath(REQ_DIR, f);
+		const full = joinPath(path, f);
 		try {
 			const st = statSync(full);
 			if (now - st.mtimeMs > REQ_STALE_MS) unlinkSync(full);
@@ -365,6 +396,8 @@ async function handleRequestFile(full: string): Promise<void> {
 		return;
 	}
 
+	const sessionId = lastCtx?.sessionManager?.getSessionId?.();
+	if (!sessionId || req.sessionId !== sessionId) return;
 	const cwd = lastCtx?.sessionManager?.getCwd?.() ?? process.cwd();
 	try {
 		await processToggleRequest(req, cwd);
@@ -373,29 +406,32 @@ async function handleRequestFile(full: string): Promise<void> {
 	} catch (e: any) {
 		console.warn(`pi-inspect: toggle failed: ${e?.message ?? e}`);
 		try {
-			writeFileSync(`${full}.err.json`, JSON.stringify({ error: e?.message ?? String(e), req }, null, 2));
+			const errorPath = `${full}.err.json`;
+			writeFileSync(errorPath, JSON.stringify({ error: e?.message ?? String(e), req }, null, 2), { mode: 0o600 });
+			chmodSync(errorPath, 0o600);
 			unlinkSync(full);
 		} catch {}
 	}
 }
 
-function setupRequestWatcher(): void {
-	ensureReqDir();
-	sweepStaleRequests();
-	// Drain orphans at startup
+function setupRequestWatcher(sessionId: string): void {
+	const dir = requestDir(sessionId);
+	ensureReqDir(dir);
+	sweepStaleRequests(dir);
+	// Drain only requests owned by this session.
 	try {
-		for (const f of readdirSync(REQ_DIR)) {
+		for (const f of readdirSync(dir)) {
 			if (f.endsWith(".err.json") || !f.endsWith(".json")) continue;
-			void handleRequestFile(joinPath(REQ_DIR, f));
+			void handleRequestFile(joinPath(dir, f));
 		}
 	} catch {}
 	if (reqWatcher) return;
 	try {
-		reqWatcher = fsWatch(REQ_DIR, (_event, filename) => {
+		reqWatcher = fsWatch(dir, (_event, filename) => {
 			if (!filename) return;
 			const name = String(filename);
 			if (!name.endsWith(".json") || name.endsWith(".err.json")) return;
-			const full = joinPath(REQ_DIR, name);
+			const full = joinPath(dir, name);
 			try { statSync(full); } catch { return; }
 			void handleRequestFile(full);
 		});
@@ -438,12 +474,25 @@ async function captureSnapshot(ctx: any): Promise<{ id: string; entry: IndexEntr
 	return { id, entry: { id, cwd, name, model, capturedAt } };
 }
 
+async function inspectServerInfo(): Promise<{ name?: string; pid?: number } | null> {
+	try {
+		const response = await fetch(`${url}/api/version`, { headers: { authorization: `Bearer ${capability}` } });
+		if (!response.ok) return null;
+		return await response.json() as { name?: string; pid?: number };
+	} catch { return null; }
+}
+
 async function startServer(notify: (m: string, l?: "info" | "error") => void): Promise<boolean> {
-	if (await probePort(port)) return true;
+	if (await probePort(port)) {
+		const info = await inspectServerInfo();
+		if (info?.name === "pi-inspect") return true;
+		notify(`port ${port} is used by another process`, "error");
+		return false;
+	}
 	lastStderr = "";
 	const serverPath = resolvePath(extDir, "..", "server.js");
 	child = spawn(process.execPath, [serverPath], {
-		env: { ...process.env, PORT: String(port) },
+		env: { ...process.env, PORT: String(port), INSPECT_CAPABILITY: capability },
 		stdio: ["ignore", "ignore", "pipe"],
 		detached: true,
 		windowsHide: true,
@@ -461,14 +510,22 @@ async function startServer(notify: (m: string, l?: "info" | "error") => void): P
 }
 
 async function stopServer(notify: (m: string, l?: "info" | "error") => void): Promise<void> {
-	if (child) child.kill("SIGINT");
-	child = null;
-	if (await probePort(port)) {
-		const pids = findPidsOnPort(port);
-		for (const pid of pids) killPid(pid);
+	let record: { pid?: number } = {};
+	try { record = JSON.parse(readFileSync(SERVER_PATH, "utf8")); } catch {}
+	try {
+		const response = await fetch(`${url}/api/version`, { headers: { authorization: `Bearer ${capability}` } });
+		const info = await response.json() as { name?: string; pid?: number };
+		if (!response.ok || info.name !== "pi-inspect" || info.pid !== record.pid || !record.pid) {
+			notify("pi-inspect server ownership could not be verified", "error");
+			return;
+		}
+		process.kill(record.pid, "SIGTERM");
+		child = null;
 		await new Promise((r) => setTimeout(r, 300));
+		notify("pi-inspect stopped");
+	} catch {
+		notify("pi-inspect is not running");
 	}
-	notify("pi-inspect stopped");
 }
 
 const SUBCOMMANDS = ["start", "stop", "restart", "status", "open", "list", "snapshot"] as const;
@@ -497,16 +554,20 @@ function showHelp(notify: (m: string, l?: "info" | "error") => void) {
 
 export default function inspectExtension(pi: ExtensionAPI) {
 	piRef = pi;
-	setupRequestWatcher();
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
-		await captureSnapshot(ctx);
+		const id = ctx.sessionManager?.getSessionId?.();
+		if (id) setupRequestWatcher(id);
 	});
-	// session_start fires before all extensions register their tools/commands.
-	// before_agent_start fires after the user's first prompt with the fully assembled state — re-capture then.
-	pi.on("before_agent_start", async (_event, ctx) => {
-		lastCtx = ctx;
-		await captureSnapshot(ctx);
+	pi.on("session_shutdown", async (_event, ctx) => {
+		reqWatcher?.close();
+		reqWatcher = null;
+		const id = ctx.sessionManager?.getSessionId?.();
+		if (id) {
+			rmSync(joinPath(SNAP_DIR, `${sanitize(id)}.json`), { force: true });
+			removeIndexEntry(id);
+		}
+		lastCtx = null;
 	});
 
 	pi.registerCommand("inspect", {
@@ -537,8 +598,8 @@ export default function inspectExtension(pi: ExtensionAPI) {
 			if (first === "stop") return stopServer(notify);
 
 			if (first === "status") {
-				const up = await probePort(port);
-				notify(up ? `running on ${url}` : "not running");
+				const info = await inspectServerInfo();
+				notify(info?.name === "pi-inspect" ? `running on ${url}` : "not running");
 				return;
 			}
 
@@ -588,14 +649,16 @@ export default function inspectExtension(pi: ExtensionAPI) {
 				openId = ctx.sessionManager?.getSessionId?.() ?? null;
 			}
 
-			const target = openId ? `${url}/?session=${encodeURIComponent(openId)}` : url;
+			const query = new URLSearchParams({ token: capability });
+			if (openId) query.set("session", openId);
+			const target = `${url}/?${query.toString()}`;
 
 			// If a dashboard tab is already connected, ask it to navigate instead of opening a new window.
 			if (!isExplicitOpen) {
 				try {
 					const r = await fetch(`${url}/api/focus`, {
 						method: "POST",
-						headers: { "content-type": "application/json" },
+						headers: { "content-type": "application/json", authorization: `Bearer ${capability}` },
 						body: JSON.stringify({ session: openId }),
 					});
 					const { delivered } = (await r.json()) as { delivered: number };
