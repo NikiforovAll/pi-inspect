@@ -1,5 +1,5 @@
 // pi-inspect service worker — network-first for dynamic data, cache-first for static shell.
-const VERSION = 'pi-inspect-v6';
+const VERSION = 'pi-inspect-v7';
 // Resolve relative to the SW scope so this works under any subpath (e.g. GitHub Pages).
 const BASE = new URL('./', self.registration?.scope || self.location.href).pathname;
 const SHELL = ['', 'index.html', 'style.css', 'app.js', 'share.js', 'manifest.webmanifest', 'icon.svg'].map((p) => BASE + p);

@@ -11,6 +11,7 @@ const githubSource = require('./lib/github-source');
 const pkg = require('./package.json');
 
 const PORT = Number(process.env.PORT) || 5462;
+const CAPABILITY = process.env.INSPECT_CAPABILITY || "";
 const args = process.argv.slice(2);
 const shouldOpen = args.includes('--open');
 const openSession = (() => {
@@ -25,9 +26,15 @@ const USER_THEME_DIR = process.env.INSPECT_THEME_DIR
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
+app.use('/api', (req, res, next) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || req.query.token || '';
+  if (!CAPABILITY || token !== CAPABILITY) return res.status(401).json({ error: 'unauthorized' });
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 
 app.get('/api/version', (_req, res) => {
-  res.json({ name: pkg.name, version: pkg.version });
+  res.json({ name: pkg.name, version: pkg.version, pid: process.pid });
 });
 
 app.get('/api/sessions', async (_req, res) => {
@@ -135,21 +142,27 @@ app.post('/api/open', (req, res) => {
   }
 });
 
-const REQ_DIR = path.join(os.homedir(), '.pi', 'agent', 'inspect', 'requests');
+const STATE_DIR = process.env.INSPECT_STATE_DIR
+  || path.join(os.tmpdir(), `pi-inspect-${process.getuid?.() ?? 'user'}`);
+const REQ_DIR = path.join(STATE_DIR, 'requests');
 
 app.post('/api/toggle', async (req, res) => {
   try {
-    const { action, resourceKind, path: target, scope } = req.body || {};
+    const { action, resourceKind, path: target, scope, sessionId } = req.body || {};
+    if (!sessionId || typeof sessionId !== 'string') return res.status(400).json({ ok: false, error: 'missing sessionId' });
     if (action !== 'enable' && action !== 'disable') return res.status(400).json({ ok: false, error: 'action must be enable|disable' });
     if (!['skills', 'prompts', 'extensions', 'themes'].includes(resourceKind)) return res.status(400).json({ ok: false, error: 'invalid resourceKind' });
     if (!target || typeof target !== 'string') return res.status(400).json({ ok: false, error: 'missing path' });
     const useScope = scope === 'project' ? 'project' : 'user';
-    await fsp.mkdir(REQ_DIR, { recursive: true });
+    const sessionReqDir = path.join(REQ_DIR, String(sessionId).replace(/[^a-zA-Z0-9._-]/g, '_'));
+    await fsp.mkdir(sessionReqDir, { recursive: true, mode: 0o700 });
+    await fsp.chmod(sessionReqDir, 0o700);
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const file = path.join(REQ_DIR, `${id}.json`);
+    const file = path.join(sessionReqDir, `${id}.json`);
     const tmp = `${file}.tmp`;
-    const body = JSON.stringify({ id, ts: Date.now(), action, resourceKind, path: target, scope: useScope });
-    await fsp.writeFile(tmp, body, 'utf8');
+    const body = JSON.stringify({ id, sessionId, ts: Date.now(), action, resourceKind, path: target, scope: useScope });
+    await fsp.writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 });
+    await fsp.chmod(tmp, 0o600);
     await fsp.rename(tmp, file);
     res.json({ ok: true, id });
   } catch (e) {
@@ -186,7 +199,8 @@ function broadcast(event, data) {
 }
 
 const SNAP_DIR = snapshots.snapshotDir();
-fs.mkdirSync(SNAP_DIR, { recursive: true });
+fs.mkdirSync(SNAP_DIR, { recursive: true, mode: 0o700 });
+fs.chmodSync(SNAP_DIR, 0o700);
 chokidar
   .watch(SNAP_DIR, { ignoreInitial: true, depth: 1 })
   .on('all', (kind, file) => {
@@ -198,7 +212,13 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 (async () => {
   await loadThemes();
-  app.listen(PORT, () => {
+  if (!CAPABILITY) throw new Error('INSPECT_CAPABILITY is required');
+  const serverRecord = path.join(STATE_DIR, 'server.json');
+  await fsp.mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
+  await fsp.chmod(STATE_DIR, 0o700);
+  await fsp.writeFile(serverRecord, JSON.stringify({ pid: process.pid, port: PORT }), { encoding: 'utf8', mode: 0o600 });
+  await fsp.chmod(serverRecord, 0o600);
+  app.listen(PORT, '127.0.0.1', () => {
     const url = `http://localhost:${PORT}${openSession ? `/?session=${encodeURIComponent(openSession)}` : ''}`;
     console.log(`pi-inspect listening on http://localhost:${PORT}`);
     if (shouldOpen) open(url).catch(() => {});
