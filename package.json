@@ -35,7 +35,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js --open",
-    "typecheck:extensions": "tsc -p extensions/tsconfig.json --noEmit"
+    "typecheck:extensions": "tsc -p extensions/tsconfig.json --noEmit",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "chokidar": "^3.5.3",
