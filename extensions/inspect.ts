@@ -399,6 +399,10 @@ function setupRequestWatcher(): void {
 			try { statSync(full); } catch { return; }
 			void handleRequestFile(full);
 		});
+		// FSWatcher is a referenced handle: without unref() it keeps the event loop
+		// alive and non-interactive runs (`pi -p`, headless/RPC) hang forever after
+		// printing their output. See issue #5.
+		reqWatcher.unref();
 	} catch (e: any) {
 		console.warn(`pi-inspect: request watcher failed: ${e?.message ?? e}`);
 	}
@@ -456,6 +460,10 @@ async function startServer(notify: (m: string, l?: "info" | "error") => void): P
 	}
 	child.stderr?.removeAllListeners("data");
 	child.stderr?.resume();
+	// The piped stderr is a referenced stream: resume() keeps draining it (so the
+	// server never blocks on a full pipe) but also keeps the event loop alive.
+	// Unref it to keep draining without pinning non-interactive exits. See issue #6.
+	(child.stderr as unknown as { unref?: () => void } | null)?.unref?.();
 	child.unref();
 	return true;
 }
