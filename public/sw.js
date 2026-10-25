@@ -1,8 +1,7 @@
-// pi-inspect service worker — network-first for dynamic data, cache-first for static shell.
-const VERSION = 'pi-inspect-v6';
-// Resolve relative to the SW scope so this works under any subpath (e.g. GitHub Pages).
+// Network first, so a new server version shows on the next load; the cache only serves the shell offline (GitHub Pages share links).
+const VERSION = 'pi-inspect-v8';
 const BASE = new URL('./', self.registration?.scope || self.location.href).pathname;
-const SHELL = ['', 'index.html', 'style.css', 'app.js', 'share.js', 'manifest.webmanifest', 'icon.svg'].map((p) => BASE + p);
+const SHELL = ['', 'index.html', 'style.css', 'app.js', 'share.js', 'fonts/fonts.css', 'manifest.webmanifest', 'icon.svg'].map((p) => BASE + p);
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).catch(() => {}));
@@ -20,24 +19,17 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;
+  if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
 
-  // Never cache API or SSE — always go to network.
-  if (url.pathname.startsWith('/api/')) return;
-
-  // Static shell: cache-first, fall back to network, then update cache.
   event.respondWith(
-    caches.match(req).then((cached) => {
-      const fetchPromise = fetch(req)
-        .then((res) => {
-          if (res && res.ok) {
-            const copy = res.clone();
-            caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {});
-          }
-          return res;
-        })
-        .catch(() => cached);
-      return cached || fetchPromise;
-    }),
+    fetch(req)
+      .then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {});
+        }
+        return res;
+      })
+      .catch(() => caches.match(req, { ignoreSearch: true }).then((hit) => hit || Response.error())),
   );
 });

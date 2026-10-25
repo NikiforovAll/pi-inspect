@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>pi-inspect</title>
+<link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="style.css">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="icon.svg">
@@ -14,102 +15,117 @@
 <meta name="theme-color" content="#e8e6e3" media="(prefers-color-scheme: light)">
 </head>
 <body>
-  <div class="topbar">
+  <header class="topbar">
     <div class="topbar-logo">
       <div class="logo-mark">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
       </div>
       <span class="logo-text">pi <span class="accent">inspect</span></span>
     </div>
-    <div class="spacer"></div>
-    <div class="topbar-search">
+    <label class="topbar-search">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-      <input type="text" id="searchInput" placeholder="Filter tools / commands..." autocomplete="off">
-    </div>
-    <select class="topbar-select" id="kindFilter">
-      <option value="all" selected>All</option>
-      <option value="context">Context</option>
-      <option value="tool">Tools</option>
-      <option value="command">Commands</option>
-      <option value="prompt">Prompts</option>
-      <option value="skill">Skills</option>
-    </select>
-    <select class="topbar-select" id="sessionSelect" title="Switch session"></select>
-    <button class="topbar-btn" id="cleanupSessionsBtn" title="Delete all snapshots except the selected session">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 01-2 2H9a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a2 2 0 012-2h2a2 2 0 012 2v2"/></svg>
-    </button>
-    <div class="topbar-project" id="projectBtn" title="Current cwd">
+      <input type="text" id="searchInput" placeholder="Filter by name or source" autocomplete="off" aria-label="Filter by name or source">
+      <kbd>/</kbd>
+    </label>
+    <select class="topbar-select" id="sessionSelect" aria-label="Session" title="Session (s)"></select>
+    <div class="topbar-project" title="Working directory">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
       <span id="projectPath">—</span>
     </div>
-    <button class="topbar-btn" id="shareBtn" title="Copy a shareable link for the current snapshot">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-      Share
-    </button>
-    <button class="topbar-btn" id="refreshBtn" title="Refresh data">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
-      Refresh
-    </button>
-    <button class="topbar-btn" id="themeBtn" title="Toggle theme">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-    </button>
-    <button class="topbar-btn" id="shortcutsBtn" title="Keyboard shortcuts (?)">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r="0.5" fill="currentColor"/></svg>
-      <kbd style="font-size:10px">?</kbd>
-    </button>
-    <a class="topbar-btn" href="https://github.com/NikiforovAll/pi-inspect" target="_blank" rel="noopener" title="GitHub">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
-    </a>
-  </div>
-
-  <div class="main-layout">
-    <div class="tree-panel" id="treePanel">
-      <div class="tree-expand-toggle" id="expandToggle">Expand all</div>
-      <div class="tree-container" id="treeContainer">
-        <div class="loading">Loading snapshot...</div>
-      </div>
+    <div class="spacer"></div>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="cleanupSessionsBtn" title="Delete the other snapshots" aria-label="Delete the other snapshots">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 01-2 2H9a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a2 2 0 012-2h2a2 2 0 012 2v2"/></svg>
+      </button>
+      <button class="icon-btn" id="shareBtn" title="Copy a share link for this snapshot" aria-label="Copy a share link">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+      </button>
+      <button class="icon-btn" id="refreshBtn" title="Refresh (r)" aria-label="Refresh">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+      </button>
+      <button class="icon-btn" id="themeBtn" title="Toggle theme (t)" aria-label="Toggle theme">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      </button>
+      <button class="icon-btn" id="shortcutsBtn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
+      </button>
+      <a class="icon-btn" id="githubLink" href="https://github.com/NikiforovAll/pi-inspect" target="_blank" rel="noopener" title="GitHub" aria-label="GitHub">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+      </a>
     </div>
-    <div class="resize-handle" id="resizeHandle"></div>
-    <div class="detail-panel" id="detailPanel">
-      <div class="detail-empty">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
-        <span>Select an item to view details</span>
-      </div>
-    </div>
-  </div>
+  </header>
 
-  <div class="toast-container" id="toast"></div>
+  <nav class="chipbar" aria-label="Filter by kind">
+    <div class="chips" id="kindChips" role="radiogroup" aria-label="Kind"></div>
+    <div class="spacer"></div>
+    <button class="text-btn" id="expandToggle" title="Expand or collapse all (e)">Collapse all</button>
+  </nav>
+
+  <main class="main-layout">
+    <section class="tree-panel" id="treePanel">
+      <div class="tree-container" id="treeContainer" role="tree" aria-label="Snapshot items" tabindex="0">
+        <div class="empty-state">Loading snapshot…</div>
+      </div>
+    </section>
+    <div class="resize-handle" id="resizeHandle" aria-hidden="true"></div>
+    <section class="detail-panel" id="detailPanel" aria-live="polite"></section>
+  </main>
+
+  <div class="toast-container" id="toast" role="status"></div>
 
   <div class="modal-overlay" id="helpModal" aria-hidden="true">
-    <div class="modal help-modal" role="dialog" aria-label="Keyboard shortcuts">
+    <div class="modal help-modal" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
       <div class="modal-header">
-        <h3>Keyboard Shortcuts</h3>
-        <button class="modal-close" id="helpCloseBtn" title="Close (Esc)">&#10005;</button>
+        <h3 id="helpTitle">Keyboard shortcuts</h3>
+        <button class="icon-btn" id="helpCloseBtn" title="Close (Esc)" aria-label="Close">&#10005;</button>
       </div>
+      <div class="modal-body help-sections">
+        <section class="help-section">
+          <h4>Navigate</h4>
+          <table>
+            <tr><td><kbd>j</kbd> <kbd>k</kbd></td><td>Next / previous row</td></tr>
+            <tr><td><kbd>g</kbd> <kbd>G</kbd></td><td>First / last row</td></tr>
+            <tr><td><kbd>l</kbd> <kbd>h</kbd></td><td>Expand group / go to parent</td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>Open row</td></tr>
+            <tr><td><kbd>e</kbd></td><td>Expand or collapse all</td></tr>
+          </table>
+        </section>
+        <section class="help-section">
+          <h4>Filter</h4>
+          <table>
+            <tr><td><kbd>/</kbd></td><td>Search</td></tr>
+            <tr><td><kbd>0</kbd>–<kbd>5</kbd></td><td>All, context, tools, commands, prompts, skills</td></tr>
+            <tr><td><kbd>s</kbd></td><td>Pick a session</td></tr>
+          </table>
+        </section>
+        <section class="help-section">
+          <h4>Item</h4>
+          <table>
+            <tr><td><kbd>o</kbd></td><td>Open in editor</td></tr>
+            <tr><td><kbd>c</kbd></td><td>Copy path</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Close item / leave input</td></tr>
+          </table>
+        </section>
+        <section class="help-section">
+          <h4>App</h4>
+          <table>
+            <tr><td><kbd>r</kbd></td><td>Refresh</td></tr>
+            <tr class="standalone-only"><td><kbd>t</kbd></td><td>Toggle theme</td></tr>
+            <tr><td><kbd>?</kbd></td><td>This help</td></tr>
+          </table>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="confirmModal" aria-hidden="true">
+    <div class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmText">
+      <div class="modal-header"><h3 id="confirmTitle">Delete snapshots</h3></div>
       <div class="modal-body">
-        <div class="help-sections">
-          <div class="help-section">
-            <h4>Global</h4>
-            <table>
-              <tr><td><kbd>?</kbd></td><td>Show this help</td></tr>
-              <tr><td><kbd>/</kbd></td><td>Focus search</td></tr>
-              <tr><td><kbd>f</kbd></td><td>Focus kind filter</td></tr>
-              <tr><td><kbd>r</kbd></td><td>Refresh</td></tr>
-              <tr><td><kbd>t</kbd></td><td>Toggle theme</td></tr>
-              <tr><td><kbd>e</kbd></td><td>Expand / collapse all</td></tr>
-              <tr><td><kbd>Esc</kbd></td><td>Close modal / clear selection / blur input</td></tr>
-            </table>
-          </div>
-          <div class="help-section">
-            <h4>Navigation</h4>
-            <table>
-              <tr><td><kbd>j</kbd> / <kbd>↓</kbd></td><td>Next row</td></tr>
-              <tr><td><kbd>k</kbd> / <kbd>↑</kbd></td><td>Previous row</td></tr>
-              <tr><td><kbd>l</kbd> / <kbd>→</kbd></td><td>Expand group</td></tr>
-              <tr><td><kbd>h</kbd> / <kbd>←</kbd></td><td>Collapse group / go to parent</td></tr>
-              <tr><td><kbd>Enter</kbd> / <kbd>Space</kbd></td><td>Select / toggle</td></tr>
-            </table>
-          </div>
+        <p id="confirmText"></p>
+        <div class="modal-actions">
+          <button class="btn" id="confirmCancel">Cancel</button>
+          <button class="btn btn-danger" id="confirmOk">Delete</button>
         </div>
       </div>
     </div>

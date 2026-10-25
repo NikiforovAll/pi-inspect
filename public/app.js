@@ -5,19 +5,13 @@ const state = {
   snapshot: null,
   search: '',
   kind: 'all',
-  expanded: { context: true, tool: true, command: true, prompt: true, skill: true },
+  collapsed: new Set(),
   selected: null,
   expandAll: true,
   highlight: -1,
   visibleRows: [],
   staticMode: false,
 };
-const els = {};
-
-function matchKey(e, ...keys) {
-  if (e.ctrlKey || e.altKey || e.metaKey) return false;
-  return keys.some((k) => e.key === k || e.code === k);
-}
 //#endregion
 
 //#region UTIL
@@ -42,10 +36,24 @@ function highlightJson(value) {
   );
 }
 
+function highlightMarkdown(md) {
+  let s = esc(md);
+  s = s.replace(/^(#{1,6}\s.*)$/gm, '<span class="md-h">$1</span>');
+  s = s.replace(/(```[\s\S]*?```)/g, '<span class="md-code">$1</span>');
+  s = s.replace(/(`[^`\n]+`)/g, '<span class="md-icode">$1</span>');
+  s = s.replace(/(\*\*[^*\n]+\*\*)/g, '<span class="md-bold">$1</span>');
+  s = s.replace(/^(\s*[-*+]\s+)/gm, '<span class="md-bullet">$1</span>');
+  return s;
+}
+
 function basename(p) {
   if (!p) return '';
   const parts = String(p).split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? '';
+}
+
+function shortId(id) {
+  return id.length > 12 ? `${id.slice(0, 8)}…` : id;
 }
 
 function getUrlSession() {
@@ -59,13 +67,20 @@ function setUrlSession(id, replace = false) {
 }
 
 function toast(msg, kind = 'info') {
-  const c = $('toast');
-  if (!c) return;
   const el = document.createElement('div');
   el.className = `toast toast-${kind}`;
   el.textContent = msg;
-  c.appendChild(el);
+  $('toast').appendChild(el);
   setTimeout(() => el.remove(), 2500);
+}
+
+function fmtChars(n) {
+  if (n == null) return '';
+  if (n < 1000) return `${n} chars`;
+  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k chars`;
+}
+function sumChars(list) {
+  return list.reduce((a, b) => a + (b.chars || 0), 0);
 }
 //#endregion
 
@@ -74,6 +89,20 @@ async function fetchJson(path) {
   const r = await fetch(path);
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
   return r.json();
+}
+
+async function postJson(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!(r.headers.get('content-type') || '').includes('application/json')) {
+    throw new Error(`server returned ${r.status}; restart the pi-inspect server`);
+  }
+  const j = await r.json();
+  if (!r.ok || j.ok === false) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
 }
 
 async function loadSessions() {
@@ -93,11 +122,38 @@ async function loadSnapshot(sessionId) {
 }
 //#endregion
 
+//#region MODEL
+const KIND_ORDER = ['context', 'tool', 'command', 'prompt', 'skill'];
+const CHIP_KINDS = ['all', ...KIND_ORDER];
+const KIND_LABEL = { all: 'All', context: 'Context', tool: 'Tools', command: 'Commands', prompt: 'Prompts', skill: 'Skills' };
+const SOURCE_RANK = { user: 0, project: 1, auto: 2, builtin: 3 };
+
+// Same rule as sourceLabel() in extensions/inspect.ts, so active and disabled items of one package group together.
+function packageName(source) {
+  if (source.startsWith('npm:')) return source.slice(4);
+  const norm = source.replace(/\\/g, '/').replace(/\/$/, '');
+  return norm.split('/').pop() || norm;
+}
+
 function inferPath(x) {
   const p = x?.sourceInfo?.path;
   if (!p || typeof p !== 'string') return null;
-  if (/^<.*>$/.test(p)) return null;
+  if (/^<.*>$/.test(p) || /^[a-z][\w-]+:/i.test(p)) return null;
   return p;
+}
+
+function inferSource(x) {
+  const si = x?.sourceInfo;
+  if (si) {
+    if (si.label) return si.label;
+    if (si.source) {
+      if (si.source === 'auto' && si.scope) return si.scope;
+      return packageName(si.source);
+    }
+    if (si.origin) return si.origin;
+    if (si.kind) return si.kind;
+  }
+  return x?.source ?? 'builtin';
 }
 
 function githubUrlFor(it) {
@@ -107,29 +163,22 @@ function githubUrlFor(it) {
   return map[root]?.url || null;
 }
 
-function inferSource(x) {
-  const si = x?.sourceInfo;
-  if (si) {
-    if (si.label) return si.label;
-    if (si.source) {
-      const src = si.source.startsWith('npm:') ? si.source.slice(4) : si.source;
-      if (src === 'auto' && si.scope) return si.scope;
-      return src;
-    }
-    if (si.origin) return si.origin;
-    if (si.kind) return si.kind;
-  }
-  return x?.source ?? 'builtin';
-}
-
-//#region MODEL
 function normPath(p) {
   if (!p || typeof p !== 'string') return null;
   return p.replace(/\\/g, '/').toLowerCase();
 }
 
-function buildItems() {
-  const s = state.snapshot;
+const oneLine = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
+const textInfo = (text) => ({ description: oneLine(text), chars: (text ?? '').length });
+const subgroupKey = (kind, source) => `${kind}::${source || '(unknown)'}`;
+
+let itemsCache = { snapshot: null, items: [] };
+function getItems() {
+  if (itemsCache.snapshot !== state.snapshot) itemsCache = { snapshot: state.snapshot, items: buildItems(state.snapshot) };
+  return itemsCache.items;
+}
+
+function buildItems(s) {
   if (!s) return [];
   const items = [];
   const activeSet = new Set(s.activeTools ?? []);
@@ -141,7 +190,6 @@ function buildItems() {
     (s.disabledItems ?? []).map((d) => normPath(d.path)).filter(Boolean),
   );
   for (const t of s.tools ?? []) {
-    const description = (t.description ?? '').replace(/\s+/g, ' ').trim();
     const id = `tool:${t.name}`;
     activeIds.add(id);
     items.push({
@@ -149,8 +197,7 @@ function buildItems() {
       id,
       name: t.name ?? '(tool)',
       source: inferSource(t),
-      description,
-      chars: (t.description ?? '').length,
+      ...textInfo(t.description),
       active: activeSet.has(t.name),
       path: inferPath(t),
       raw: t,
@@ -161,55 +208,35 @@ function buildItems() {
     if (cp && disabledPaths.has(cp)) continue;
     const name = c.name ?? c.command ?? '';
     const isSkill = name.startsWith('skill:');
-    const src = inferSource(c);
     const isPrompt = !isSkill && c.source === 'prompt';
     const kind = isSkill ? 'skill' : isPrompt ? 'prompt' : 'command';
-    const description = (c.description ?? '').replace(/\s+/g, ' ').trim();
-    const idName = isSkill ? name.slice('skill:'.length) : name;
-    const id = `${kind}:${idName}`;
+    const id = `${kind}:${isSkill ? name.slice('skill:'.length) : name}`;
     activeIds.add(id);
     items.push({
       kind,
       id,
       name: `/${name}`,
-      source: src,
-      description,
-      chars: (c.description ?? '').length,
+      source: inferSource(c),
+      ...textInfo(c.description),
       path: inferPath(c),
       raw: c,
     });
   }
-  for (const d of s.disabledItems ?? []) {
-    const id = `${d.kind}:${d.name}`;
-    if (activeIds.has(id)) continue;
-    const description = (d.description ?? '').replace(/\s+/g, ' ').trim();
-    items.push({
-      kind: d.kind,
-      id,
-      name: d.displayName ?? d.name,
-      source: d.source ?? '(package)',
-      description,
-      chars: (d.description ?? '').length,
-      disabled: true,
-      path: d.path ?? null,
-      raw: d,
-    });
-  }
-  for (const d of s.pendingItems ?? []) {
-    const id = `${d.kind}:${d.name}`;
-    if (activeIds.has(id)) continue;
-    const description = (d.description ?? '').replace(/\s+/g, ' ').trim();
-    items.push({
-      kind: d.kind,
-      id,
-      name: d.displayName ?? d.name,
-      source: d.source ?? '(package)',
-      description,
-      chars: (d.description ?? '').length,
-      pending: true,
-      path: d.path ?? null,
-      raw: d,
-    });
+  for (const [list, flag] of [[s.disabledItems, 'disabled'], [s.pendingItems, 'pending']]) {
+    for (const d of list ?? []) {
+      const id = `${d.kind}:${d.name}`;
+      if (activeIds.has(id)) continue;
+      items.push({
+        kind: d.kind,
+        id,
+        name: d.displayName ?? d.name,
+        source: d.source ?? '(package)',
+        ...textInfo(d.description),
+        [flag]: true,
+        path: d.path ?? null,
+        raw: d,
+      });
+    }
   }
   if (s.systemPrompt) {
     for (const part of splitSystemPrompt(s.systemPrompt, s.cwd)) {
@@ -217,8 +244,7 @@ function buildItems() {
         kind: 'context',
         id: `context:${part.id}`,
         name: part.name,
-        source: `${part.text.length} chars`,
-        description: part.text.slice(0, 240).replace(/\s+/g, ' '),
+        description: oneLine(part.text.slice(0, 240)),
         chars: part.text.length,
         path: part.path ?? null,
         raw: { systemPrompt: part.text, path: part.path ?? null },
@@ -226,61 +252,6 @@ function buildItems() {
     }
   }
   return items;
-}
-
-function fmtChars(n) {
-  if (n == null) return '';
-  if (n < 1000) return `${n} chars`;
-  return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k chars`;
-}
-function sumChars(list) {
-  return list.reduce((a, b) => a + (b.chars || 0), 0);
-}
-
-function filterItems(items) {
-  const q = state.search.trim().toLowerCase();
-  return items.filter((it) => {
-    if (state.kind !== 'all' && it.kind !== state.kind) return false;
-    if (!q) return true;
-    return (
-      it.name.toLowerCase().includes(q) ||
-      (it.source ?? '').toLowerCase().includes(q)
-    );
-  });
-}
-
-const KIND_ORDER = ['context', 'tool', 'command', 'prompt', 'skill'];
-const KIND_LABEL = { context: 'Context', tool: 'Tools', command: 'Commands', prompt: 'Prompts', skill: 'Skills' };
-const SOURCE_RANK = { user: 0, project: 1, auto: 2, builtin: 3 };
-//#endregion
-
-//#region ICONS
-function iconFor(kind) {
-  if (kind === 'tool') {
-    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>`;
-  }
-  if (kind === 'command') {
-    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`;
-  }
-  if (kind === 'prompt') {
-    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="13" y2="13"/></svg>`;
-  }
-  if (kind === 'skill') {
-    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`;
-  }
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`;
-}
-function chevronSvg() {
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 6 15 12 9 18"/></svg>`;
-}
-function highlightMarkdown(md) {
-  let s = esc(md);
-  s = s.replace(/^(#{1,6}\s.*)$/gm, '<span class="md-h">$1</span>');
-  s = s.replace(/(```[\s\S]*?```)/g, '<span class="md-code">$1</span>');
-  s = s.replace(/(`[^`\n]+`)/g, '<span class="md-icode">$1</span>');
-  s = s.replace(/(\*\*[^*\n]+\*\*)/g, '<span class="md-bold">$1</span>');
-  s = s.replace(/^(\s*[-*+]\s+)/gm, '<span class="md-bullet">$1</span>');
-  return s;
 }
 
 function splitSystemPrompt(prompt, cwd) {
@@ -299,19 +270,18 @@ function splitSystemPrompt(prompt, cwd) {
   const ctxHeader = prompt.lastIndexOf('\n# Project Context', sysEnd);
   if (ctxHeader > 0) sysEnd = ctxHeader;
   parts.push({ id: 'system-prompt', name: 'system prompt', text: prompt.slice(0, sysEnd).trimEnd(), order: 0 });
+  const cwdNorm = normPath(cwd);
   for (let i = 0; i < hits.length; i++) {
     const start = hits[i].end;
     const end = i + 1 < hits.length ? hits[i + 1].index : memoryEnd;
     const pathMatch = hits[i].header.match(/##\s+(.+?\.md)\s*$/);
     const fullPath = pathMatch ? pathMatch[1].trim() : '(memory)';
-    const norm = fullPath.replace(/\\/g, '/').toLowerCase();
+    const norm = normPath(fullPath);
     const isUserScope = /\/\.pi\/agent\//.test(norm) || /\/\.agents\//.test(norm);
-    const cwdNorm = cwd ? String(cwd).replace(/\\/g, '/').toLowerCase() : null;
     const isProject = !isUserScope && (cwdNorm ? norm.startsWith(cwdNorm) : true);
-    const fileName = fullPath.split(/[\\/]/).pop() || 'memory';
     parts.push({
       id: `memory:${i}`,
-      name: `${isProject ? 'project' : 'user'} · ${fileName}`,
+      name: `${isProject ? 'project' : 'user'} · ${basename(fullPath) || 'memory'}`,
       text: prompt.slice(start, end).trim(),
       path: fullPath,
       order: isProject ? 2 : 1,
@@ -321,311 +291,483 @@ function splitSystemPrompt(prompt, cwd) {
   return parts;
 }
 
-function packageSvg() {
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>`;
+function matchesSearch(items) {
+  const q = state.search.trim().toLowerCase();
+  if (!q) return items;
+  return items.filter((it) => it.name.toLowerCase().includes(q) || (it.source ?? '').toLowerCase().includes(q));
 }
+
+function defaultSelection() {
+  return getItems().find((x) => x.kind === 'context')?.id ?? null;
+}
+//#endregion
+
+//#region ICONS
+const ICONS = {
+  tool: '<path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/>',
+  command: '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
+  prompt: '<path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="13" y2="13"/>',
+  skill: '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+  context: '<path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>',
+  package: '<path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>',
+  chevron: '<polyline points="9 6 15 12 9 18"/>',
+  editor: '<path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>',
+  github: '<path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 00-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0020 4.77 5.07 5.07 0 0019.91 1S18.73.65 16 2.48a13.38 13.38 0 00-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 005 4.77a5.44 5.44 0 00-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 009 18.13V22"/>',
+};
+const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">${ICONS[name] ?? ICONS.context}</svg>`;
 //#endregion
 
 //#region RENDER TOPBAR
 function renderTopbar() {
-  // Session picker
   const sel = $('sessionSelect');
-  sel.innerHTML = '';
-  if (!state.sessions.length) {
-    const opt = document.createElement('option');
-    opt.value = '';
-    opt.textContent = '(no sessions)';
-    sel.appendChild(opt);
-    sel.disabled = true;
-  } else {
-    sel.disabled = false;
-    for (const s of state.sessions) {
-      const opt = document.createElement('option');
-      opt.value = s.id;
-      const label = s.name ? s.name : `${s.id.slice(0, 8)}…`;
-      const cwd = s.cwd ? ` · ${basename(s.cwd)}` : '';
-      opt.textContent = `${label}${cwd}`;
-      if (s.id === state.currentSessionId) opt.selected = true;
-      sel.appendChild(opt);
-    }
-  }
-  // Project path
+  const id = state.currentSessionId;
+  const options = state.sessions.map((s) => ({
+    id: s.id,
+    label: `${s.name || shortId(s.id)}${s.cwd ? ` · ${basename(s.cwd)}` : ''}`,
+  }));
+  if (id && !state.sessions.some((s) => s.id === id)) options.unshift({ id, label: `${shortId(id)} · not captured` });
+  sel.innerHTML = options.length
+    ? options.map((o) => `<option value="${esc(o.id)}"${o.id === id ? ' selected' : ''}>${esc(o.label)}</option>`).join('')
+    : '<option value="">No sessions</option>';
+  sel.disabled = !options.length;
   $('projectPath').textContent = state.snapshot?.cwd ?? '—';
+}
+
+function renderChips(matched) {
+  const counts = { all: matched.length };
+  for (const it of matched) counts[it.kind] = (counts[it.kind] ?? 0) + 1;
+  $('kindChips').innerHTML = CHIP_KINDS.map((k, i) => {
+    const on = state.kind === k;
+    return `<button class="chip${on ? ' active' : ''}" role="radio" aria-checked="${on}" data-kind="${k}" title="${KIND_LABEL[k]} (${i})">
+      <kbd>${i}</kbd><span>${KIND_LABEL[k]}</span><span class="chip-count">${counts[k] ?? 0}</span>
+    </button>`;
+  }).join('');
 }
 //#endregion
 
 //#region RENDER TREE
+function emptyStateHtml() {
+  if (state.staticMode) return 'No snapshot in this link. Open a share link, or run pi with pi-inspect loaded.';
+  const id = state.currentSessionId;
+  if (!id) {
+    return state.sessions.length
+      ? 'Cannot read the latest snapshot.'
+      : 'No snapshots yet. Start pi with pi-inspect loaded, or run <code>/inspect snapshot</code> in a pi session.';
+  }
+  if (!state.sessions.some((s) => s.id === id)) {
+    return `<strong>Session ${esc(shortId(id))} was not captured.</strong>
+      pi-inspect captures a session when it starts with the extension loaded.
+      To capture this session now, run <code>/inspect snapshot</code> in it.`;
+  }
+  return 'The snapshot for this session is missing or cannot be read. Run <code>/inspect snapshot</code> in the session.';
+}
+
+function groupRow(index, label, iconName, list, level, expanded, key) {
+  return `
+    <div class="tree-row tree-group level-${level}" id="row-${index}" data-index="${index}" role="treeitem" aria-level="${level}" aria-expanded="${expanded}" data-key="${esc(key)}">
+      <span class="tree-chevron">${icon('chevron')}</span>
+      <span class="tree-icon">${icon(iconName)}</span>
+      <span class="tree-label">${esc(label)}</span>
+      <span class="spacer"></span>
+      <span class="tree-meta">${list.length} · ${fmtChars(sumChars(list))}</span>
+    </div>`;
+}
+
+function itemRow(index, it, level) {
+  const cls = [it.disabled && 'disabled', state.selected === it.id && 'selected'].filter(Boolean).join(' ');
+  const meta = it.kind === 'context' ? fmtChars(it.chars) : it.source;
+  const badge = it.disabled
+    ? '<span class="tree-badge">disabled</span>'
+    : it.pending
+      ? '<span class="tree-badge warn" title="Enabled in settings, active after a pi restart">restart pi</span>'
+      : '';
+  return `
+    <div class="tree-row level-${level} ${cls}" id="row-${index}" data-index="${index}" role="treeitem" aria-level="${level}" aria-selected="${state.selected === it.id}" data-key="${esc(it.id)}">
+      <span class="tree-icon">${icon(it.kind)}</span>
+      <span class="tree-label">${esc(it.name)}</span>${badge}
+      <span class="tree-desc">${esc(it.description)}</span>
+      ${level < 3 ? `<span class="tree-meta">${esc(meta)}</span>` : ''}
+    </div>`;
+}
+
 function renderTree() {
   const root = $('treeContainer');
-  const items = filterItems(buildItems());
-  if (!state.snapshot) {
-    root.innerHTML = state.staticMode
-      ? `<div class="loading">No snapshot in this URL. Open a shared link, or run pi /inspect locally.</div>`
-      : `<div class="loading">No snapshot for this session. Run <code>/inspect snapshot</code> in a pi session.</div>`;
-    return;
-  }
-  if (!items.length) {
-    root.innerHTML = `<div class="loading">No items match the current filter.</div>`;
-    return;
-  }
-
-  const groups = new Map();
-  for (const k of KIND_ORDER) groups.set(k, []);
-  for (const it of items) {
-    const g = groups.get(it.kind);
-    if (g) g.push(it);
-  }
-
-  const html = [];
+  const matched = matchesSearch(getItems());
+  renderChips(matched);
   const rows = [];
+  const html = [];
+  state.visibleRows = rows;
+  if (!state.snapshot) {
+    root.innerHTML = `<div class="empty-state">${emptyStateHtml()}</div>`;
+    return;
+  }
+  const items = state.kind === 'all' ? matched : matched.filter((it) => it.kind === state.kind);
+  if (!items.length) {
+    root.innerHTML = '<div class="empty-state">No items match the filter.</div>';
+    return;
+  }
+
   for (const kind of KIND_ORDER) {
-    const list = groups.get(kind);
+    const list = items.filter((it) => it.kind === kind);
     if (!list.length) continue;
-    const expanded = state.expanded[kind];
+    const expanded = !state.collapsed.has(kind);
+    html.push(groupRow(rows.length, KIND_LABEL[kind], kind, list, 1, expanded, kind));
     rows.push({ type: 'group', key: kind });
-    const groupChars = sumChars(list);
-    html.push(`
-      <div class="tree-row marketplace-row" data-group="${kind}">
-        <div class="tree-chevron ${expanded ? 'expanded' : ''}">${chevronSvg()}</div>
-        <div class="tree-icon">${iconFor(kind)}</div>
-        <div class="tree-label"><span class="mkt-name">${esc(KIND_LABEL[kind])}</span></div>
-        <div class="spacer"></div>
-        <div class="tree-meta">${list.length} · ${fmtChars(groupChars)}</div>
-      </div>
-    `);
-    if (expanded) {
-      const bySource = new Map();
+    if (!expanded) continue;
+
+    const bySource = new Map();
+    for (const it of list) {
+      const k = it.source || '(unknown)';
+      if (!bySource.has(k)) bySource.set(k, []);
+      bySource.get(k).push(it);
+    }
+    if (bySource.size <= 1 || kind === 'context') {
       for (const it of list) {
-        const k = it.source || '(unknown)';
-        if (!bySource.has(k)) bySource.set(k, []);
-        bySource.get(k).push(it);
+        html.push(itemRow(rows.length, it, 2));
+        rows.push({ type: 'item', key: it.id });
       }
-      const useSubgroups = bySource.size > 1 && kind !== 'context';
-      const sources = useSubgroups
-        ? [...bySource.keys()].sort((a, b) => {
-            const ra = SOURCE_RANK[a] ?? Infinity;
-            const rb = SOURCE_RANK[b] ?? Infinity;
-            return (ra - rb) || a.localeCompare(b);
-          })
-        : ['__all__'];
-      if (!useSubgroups) bySource.set('__all__', list);
-      for (const src of sources) {
-        const sublist = bySource.get(src);
-        const subKey = `${kind}::${src}`;
-        const subExpanded = state.expanded[subKey] !== false;
-        if (useSubgroups) {
-          rows.push({ type: 'subgroup', key: subKey });
-          const subChars = sumChars(sublist);
-          html.push(`
-            <div class="tree-row marketplace-row tree-subgroup" data-subgroup="${esc(subKey)}" style="padding-left:24px">
-              <div class="tree-chevron ${subExpanded ? 'expanded' : ''}">${chevronSvg()}</div>
-              <div class="tree-icon">${packageSvg()}</div>
-              <div class="tree-label"><span class="mkt-name">${esc(src)}</span></div>
-              <div class="spacer"></div>
-              <div class="tree-meta">${sublist.length} · ${fmtChars(subChars)}</div>
-            </div>
-          `);
-        }
-        if (!useSubgroups || subExpanded) {
-          for (const it of sublist) {
-            const selected = state.selected === it.id ? 'selected' : '';
-            const pad = useSubgroups ? 48 : 32;
-            rows.push({ type: 'item', key: it.id });
-            const descHtml = it.description
-              ? `<span class="tree-desc">${esc(it.description)}</span><div class="spacer"></div>`
-              : '<div class="spacer"></div>';
-            const stateCls = it.disabled ? ' disabled' : (it.pending ? ' pending' : '');
-            const stateBadge = it.pending ? `<span class="tree-badge pending" title="Enabled in settings but not yet active — restart pi">restart pi</span>` : '';
-            html.push(`
-              <div class="tree-row ${selected}${stateCls}" data-item="${esc(it.id)}" style="padding-left:${pad}px">
-                <div class="tree-icon">${iconFor(it.kind)}</div>
-                <div class="tree-label">${esc(it.name)}${stateBadge}</div>
-                ${descHtml}
-                <div class="tree-meta">${esc(it.source)}</div>
-              </div>
-            `);
-          }
-        }
+      continue;
+    }
+    const sources = [...bySource.keys()].sort(
+      (a, b) => ((SOURCE_RANK[a] ?? Infinity) - (SOURCE_RANK[b] ?? Infinity)) || a.localeCompare(b),
+    );
+    for (const src of sources) {
+      const sublist = bySource.get(src);
+      const subKey = subgroupKey(kind, src);
+      const subExpanded = !state.collapsed.has(subKey);
+      html.push(groupRow(rows.length, src, 'package', sublist, 2, subExpanded, subKey));
+      rows.push({ type: 'subgroup', key: subKey });
+      if (!subExpanded) continue;
+      for (const it of sublist) {
+        html.push(itemRow(rows.length, it, 3));
+        rows.push({ type: 'item', key: it.id });
       }
     }
   }
   root.innerHTML = html.join('');
-  state.visibleRows = rows;
   if (state.highlight >= rows.length) state.highlight = rows.length - 1;
-  if (state.highlight >= 0) {
-    const el = root.children[state.highlight];
-    if (el) el.classList.add('focused');
-  }
+  paintHighlight();
+}
 
-  root.querySelectorAll('.tree-row[data-group]').forEach((el) => {
-    el.addEventListener('click', () => {
-      const k = el.dataset.group;
-      state.expanded[k] = !state.expanded[k];
-      renderTree();
-    });
-  });
-  root.querySelectorAll('.tree-row[data-subgroup]').forEach((el) => {
-    el.addEventListener('click', () => {
-      const k = el.dataset.subgroup;
-      state.expanded[k] = state.expanded[k] === false;
-      renderTree();
-    });
-  });
-  root.querySelectorAll('.tree-row[data-item]').forEach((el) => {
-    el.addEventListener('click', () => {
-      state.selected = el.dataset.item;
-      state.highlight = -1;
-      renderTree();
-      renderDetail();
-    });
-  });
+function paintHighlight() {
+  const root = $('treeContainer');
+  root.querySelector('.tree-row.focused')?.classList.remove('focused');
+  const el = state.highlight >= 0 ? root.children[state.highlight] : null;
+  if (el?.classList.contains('tree-row')) {
+    el.classList.add('focused');
+    root.setAttribute('aria-activedescendant', el.id);
+    el.scrollIntoView({ block: 'nearest' });
+  } else {
+    root.removeAttribute('aria-activedescendant');
+  }
+}
+
+function selectItem(id) {
+  state.selected = id;
+  for (const el of $('treeContainer').querySelectorAll('.tree-row[aria-selected]')) {
+    const on = el.dataset.key === id;
+    el.classList.toggle('selected', on);
+    el.setAttribute('aria-selected', String(on));
+  }
+  renderDetail();
+}
+
+function activateRow(idx) {
+  const r = state.visibleRows[idx];
+  if (!r) return;
+  state.highlight = idx;
+  if (r.type === 'item') {
+    paintHighlight();
+    selectItem(r.key);
+    return;
+  }
+  setExpanded(r.key, state.collapsed.has(r.key));
+}
+
+function setExpanded(key, open) {
+  if (open) state.collapsed.delete(key);
+  else state.collapsed.add(key);
+  renderTree();
+}
+
+function setHighlight(idx) {
+  const rows = state.visibleRows;
+  if (!rows.length) return;
+  state.highlight = Math.max(0, Math.min(rows.length - 1, idx));
+  paintHighlight();
+  const r = rows[state.highlight];
+  if (r.type === 'item' && r.key !== state.selected) selectItem(r.key);
+}
+
+function moveHighlight(delta) {
+  const rows = state.visibleRows;
+  if (!rows.length) return;
+  let idx = state.highlight;
+  if (idx < 0) {
+    const sel = rows.findIndex((r) => r.type === 'item' && r.key === state.selected);
+    idx = sel >= 0 ? sel + delta : delta > 0 ? 0 : rows.length - 1;
+  } else idx += delta;
+  setHighlight(idx);
+}
+
+function expandAtHighlight(open) {
+  const r = state.visibleRows[state.highlight];
+  if (!r) return;
+  if (r.type === 'item') {
+    if (open) return;
+    for (let i = state.highlight - 1; i >= 0; i--) {
+      if (state.visibleRows[i].type !== 'item') return setHighlight(i);
+    }
+    return;
+  }
+  if (state.collapsed.has(r.key) !== open) {
+    if (open) setHighlight(state.highlight + 1);
+    else if (r.type === 'subgroup') {
+      for (let i = state.highlight - 1; i >= 0; i--) {
+        if (state.visibleRows[i].type === 'group') return setHighlight(i);
+      }
+    }
+    return;
+  }
+  setExpanded(r.key, open);
+}
+
+function toggleExpandAll() {
+  state.expandAll = !state.expandAll;
+  state.collapsed.clear();
+  if (!state.expandAll) {
+    for (const k of KIND_ORDER) state.collapsed.add(k);
+    for (const it of getItems()) state.collapsed.add(subgroupKey(it.kind, it.source));
+  }
+  $('expandToggle').textContent = state.expandAll ? 'Collapse all' : 'Expand all';
+  renderTree();
+}
+
+function setKind(kind) {
+  if (!CHIP_KINDS.includes(kind) || state.kind === kind) return;
+  state.kind = kind;
+  state.highlight = -1;
+  renderTree();
 }
 //#endregion
 
 //#region RENDER DETAIL
+function toggleRequestFor(it) {
+  if (it.kind !== 'skill' && it.kind !== 'prompt') return null;
+  if (!it.path) return null;
+  const scope = it.disabled ? it.raw?.scope : it.raw?.sourceInfo?.scope;
+  return {
+    action: it.disabled ? 'enable' : 'disable',
+    resourceKind: it.kind === 'skill' ? 'skills' : 'prompts',
+    path: it.path,
+    scope: scope === 'project' ? 'project' : 'user',
+  };
+}
+
+const highlightedText = new WeakMap();
+function promptHtml(it) {
+  if (!highlightedText.has(it)) highlightedText.set(it, highlightMarkdown(it.raw.systemPrompt));
+  return highlightedText.get(it);
+}
+
+function metaRow(label, value) {
+  return value == null || value === '' ? '' : `<dt>${label}</dt><dd>${esc(value)}</dd>`;
+}
+
+let detailItem = null;
 function renderDetail() {
   const panel = $('detailPanel');
-  if (!state.selected || !state.snapshot) {
+  const it = state.snapshot && state.selected ? getItems().find((x) => x.id === state.selected) : null;
+  if (it && it === detailItem) return;
+  detailItem = it;
+  if (!it) {
     panel.innerHTML = `
       <div class="detail-empty">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
-        <span>Select an item to view details</span>
+        ${icon('context')}
+        <span>${state.selected && state.snapshot ? 'This item is not in the snapshot.' : 'Select an item to see its details.'}</span>
+        <span class="hint"><kbd>j</kbd> <kbd>k</kbd> to move, <kbd>?</kbd> for all keys</span>
       </div>`;
-    return;
-  }
-  const items = buildItems();
-  const it = items.find((x) => x.id === state.selected);
-  if (!it) {
-    panel.innerHTML = `<div class="detail-empty"><span>Item not found in current snapshot.</span></div>`;
     return;
   }
 
   const isPrompt = it.kind === 'context' && it.raw?.systemPrompt;
-  const bodySections = [];
-
+  const si = it.raw?.sourceInfo;
+  const status = it.disabled
+    ? `disabled${it.raw?.scope ? ` (${it.raw.scope})` : ''}`
+    : it.pending ? 'restart pi to activate' : it.active === false ? 'inactive' : it.active ? 'active' : null;
+  const sections = [];
   if (it.description && !isPrompt) {
-    bodySections.push(`
-      <div class="detail-section">
-        <h4>Description</h4>
-        <div class="detail-desc">${esc(it.description)}</div>
-      </div>
-    `);
+    sections.push(`<section class="detail-section"><h4>Description</h4><p class="detail-desc">${esc(it.description)}</p></section>`);
   }
-
-  const scope = it.raw?.scope;
-  const settingsPath = it.raw?.settingsPath;
-  bodySections.push(`
-    <div class="detail-section">
-      <h4>Metadata</h4>
-      <div class="detail-meta-row">
-        <span class="detail-meta-item">Kind: ${esc(it.kind)}</span>
-        <span class="detail-meta-item">Source: ${esc(it.source)}</span>
-        ${it.active != null ? `<span class="detail-meta-item">Active: ${it.active ? 'yes' : 'no'}</span>` : ''}
-        ${it.disabled ? `<span class="detail-meta-item">Disabled${scope ? ` (${esc(scope)})` : ''}</span>` : ''}
-        ${settingsPath ? `<span class="detail-meta-item">Settings: ${esc(settingsPath)}</span>` : ''}
-      </div>
-    </div>
-  `);
-
-  if (isPrompt) {
-    bodySections.push(`
-      <div class="detail-section">
-        <h4>System prompt (${it.raw.systemPrompt.length} chars)</h4>
-        <pre class="content-viewer-code"><code class="md">${highlightMarkdown(it.raw.systemPrompt)}</code></pre>
-      </div>
-    `);
-  } else {
-    bodySections.push(`
-      <div class="detail-section">
-        <h4>Raw</h4>
-        <pre class="content-viewer-code"><code class="json">${highlightJson(it.raw)}</code></pre>
-      </div>
-    `);
-  }
+  sections.push(`
+    <section class="detail-section">
+      <h4>Details</h4>
+      <dl class="meta-grid">
+        ${metaRow('Kind', it.kind)}
+        ${metaRow('Source', it.source)}
+        ${si?.source && packageName(si.source) !== si.source ? metaRow('Package', si.source) : ''}
+        ${metaRow('Scope', si?.scope)}
+        ${metaRow('Status', status)}
+        ${metaRow('Settings', it.raw?.settingsPath)}
+        ${metaRow('Path', it.path)}
+      </dl>
+    </section>`);
+  sections.push(isPrompt
+    ? `<section class="detail-section"><h4>Text · ${fmtChars(it.raw.systemPrompt.length)}</h4><pre class="code-view"><code class="md">${promptHtml(it)}</code></pre></section>`
+    : `<section class="detail-section"><h4>Raw</h4><pre class="code-view"><code class="json">${highlightJson(it.raw)}</code></pre></section>`);
 
   const ghUrl = githubUrlFor(it);
-  const toggleInfo = toggleInfoFor(it);
+  const toggle = state.staticMode ? null : toggleRequestFor(it);
+  const enable = toggle?.action === 'enable';
   const allowEditor = !state.staticMode && it.path;
   panel.innerHTML = `
     <div class="detail-header">
-      <h3>${iconFor(it.kind)} ${esc(it.name)} <span class="version">${esc(it.kind)}</span></h3>
-      <div class="detail-header-actions">
-        ${toggleInfo ? `<button class="detail-action" id="toggleBtn" title="${toggleInfo.enable ? 'Enable' : 'Disable'} (${toggleInfo.scope})">${toggleInfo.enable ? 'Enable' : 'Disable'}</button>` : ''}
-        ${allowEditor ? `<button class="detail-action" id="openEditorBtn" title="Open in $EDITOR"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></button>` : ''}
-        ${it.path ? `<button class="detail-action" id="copyPathBtn" title="Copy path"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button>` : ''}
-        ${ghUrl ? `<button class="detail-action" id="openGithubBtn" title="Open on GitHub"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.05 0 0 .96-.31 3.15 1.18a10.96 10.96 0 015.74 0c2.18-1.49 3.14-1.18 3.14-1.18.63 1.59.23 2.76.11 3.05.74.81 1.18 1.84 1.18 3.1 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.68.8.56C20.21 21.38 23.5 17.07 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg></button>` : ''}
-        <button class="detail-close" id="detailCloseBtn" title="Close">&#10005;</button>
-      </div>
+      <span class="tree-icon">${icon(it.kind)}</span>
+      <h3>${esc(it.name)}</h3>
+      <span class="kind-tag">${esc(it.kind)}</span>
+      <span class="spacer"></span>
+      ${toggle ? `<button class="btn btn-small" id="toggleBtn" title="${enable ? 'Enable' : 'Disable'} in ${toggle.scope} settings">${enable ? 'Enable' : 'Disable'}</button>` : ''}
+      ${allowEditor ? `<button class="icon-btn" id="openEditorBtn" title="Open in editor (o)" aria-label="Open in editor">${icon('editor')}</button>` : ''}
+      ${it.path ? `<button class="icon-btn" id="copyPathBtn" title="Copy path (c)" aria-label="Copy path">${icon('copy')}</button>` : ''}
+      ${ghUrl ? `<a class="icon-btn" href="${esc(ghUrl)}" target="_blank" rel="noopener" title="Open on GitHub" aria-label="Open on GitHub">${icon('github')}</a>` : ''}
+      <button class="icon-btn" id="detailCloseBtn" title="Close (Esc)" aria-label="Close">&#10005;</button>
     </div>
-    <div class="detail-body">${bodySections.join('')}</div>
-  `;
-  $('detailCloseBtn').addEventListener('click', () => {
-    state.selected = null;
-    renderTree();
-    renderDetail();
-  });
-  const openBtn = $('openEditorBtn');
-  if (openBtn) openBtn.addEventListener('click', async () => {
+    <div class="detail-body">${sections.join('')}</div>`;
+
+  $('detailCloseBtn').addEventListener('click', closeDetail);
+  $('openEditorBtn')?.addEventListener('click', async () => {
     try {
-      const r = await fetch('/api/open', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path: it.path }),
-      });
-      const ct = r.headers.get('content-type') || '';
-      if (!ct.includes('application/json')) {
-        toast(`Failed: server returned ${r.status} — restart pi-inspect server`);
-        return;
-      }
-      const j = await r.json();
-      toast(j.ok ? `Opened in ${j.editor}` : `Failed: ${j.error || 'unknown'}`);
-    } catch (e) { toast(`Failed: ${e.message}`); }
+      const j = await postJson('/api/open', { path: it.path });
+      toast(`Opened in ${j.editor}`, 'success');
+    } catch (e) { toast(`Open failed: ${e.message}`, 'error'); }
   });
-  const copyBtn = $('copyPathBtn');
-  if (copyBtn) copyBtn.addEventListener('click', async () => {
-    try { await navigator.clipboard.writeText(it.path); toast('Path copied'); }
-    catch { toast('Copy failed'); }
-  });
-  const ghBtn = $('openGithubBtn');
-  if (ghBtn && ghUrl) ghBtn.addEventListener('click', () => {
-    window.open(ghUrl, '_blank', 'noopener');
+  $('copyPathBtn')?.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(it.path); toast('Path copied', 'success'); }
+    catch { toast('Copy failed', 'error'); }
   });
   const toggleBtn = $('toggleBtn');
-  if (toggleBtn && toggleInfo) toggleBtn.addEventListener('click', async () => {
-    if (state.staticMode) { toast('shared view is read-only — run pi-inspect locally to toggle'); return; }
+  toggleBtn?.addEventListener('click', async () => {
     toggleBtn.disabled = true;
     try {
-      const r = await fetch('/api/toggle', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          action: toggleInfo.enable ? 'enable' : 'disable',
-          resourceKind: toggleInfo.resourceKind,
-          path: toggleInfo.path,
-          scope: toggleInfo.scope,
-        }),
-      });
-      const j = await r.json();
-      if (!r.ok || j.ok === false) throw new Error(j.error || `HTTP ${r.status}`);
-      toast(`${toggleInfo.enable ? 'Enabled' : 'Disabled'} ${it.name} — restart pi to apply fully`);
+      await postJson('/api/toggle', toggle);
+      toast(`${enable ? 'Enabled' : 'Disabled'} ${it.name}. Restart pi to apply it fully.`, 'success');
     } catch (e) {
-      toast(`Toggle failed: ${e.message}`);
+      toast(`Toggle failed: ${e.message}`, 'error');
       toggleBtn.disabled = false;
     }
   });
 }
 
-function toggleInfoFor(it) {
-  if (it.kind !== 'skill' && it.kind !== 'prompt') return null;
-  if (!it.path) return null;
-  const resourceKind = it.kind === 'skill' ? 'skills' : 'prompts';
-  if (it.disabled) {
-    const scope = it.raw?.scope === 'project' ? 'project' : 'user';
-    return { enable: true, resourceKind, path: it.path, scope };
+function closeDetail() {
+  if (!state.selected) return;
+  selectItem(null);
+}
+
+function clickDetailButton(id, missing) {
+  const btn = $(id);
+  if (btn) btn.click();
+  else toast(state.selected ? missing : 'Select an item first');
+}
+//#endregion
+
+//#region MODALS
+let confirmResolve = null;
+
+function isOpen(id) { return $(id).classList.contains('open'); }
+function setModal(id, open) {
+  $(id).classList.toggle('open', open);
+  $(id).setAttribute('aria-hidden', String(!open));
+}
+
+function confirmDialog(text) {
+  $('confirmText').textContent = text;
+  setModal('confirmModal', true);
+  $('confirmCancel').focus();
+  return new Promise((resolve) => { confirmResolve = resolve; });
+}
+
+function settleConfirm(value) {
+  setModal('confirmModal', false);
+  confirmResolve?.(value);
+  confirmResolve = null;
+  $('treeContainer').focus();
+}
+
+function trapTab(e, ids) {
+  const i = ids.indexOf(document.activeElement?.id);
+  e.preventDefault();
+  $(ids[(i + (e.shiftKey ? ids.length - 1 : 1)) % ids.length]).focus();
+}
+//#endregion
+
+//#region ACTIONS
+function renderAll() {
+  renderTopbar();
+  renderTree();
+  renderDetail();
+}
+
+async function switchSession(id, { push = true } = {}) {
+  if (push) setUrlSession(id);
+  await loadSnapshot(id);
+  state.selected = defaultSelection();
+  state.highlight = -1;
+  renderAll();
+}
+
+async function reload() {
+  await Promise.all([loadSessions(), loadSnapshot(state.currentSessionId)]);
+  renderAll();
+}
+
+async function refresh() {
+  if (state.staticMode) return;
+  const btn = $('refreshBtn');
+  btn.classList.add('loading');
+  try {
+    await reload();
+    toast('Refreshed');
+  } catch (e) {
+    toast(`Refresh failed: ${e.message}`, 'error');
+  } finally {
+    setTimeout(() => btn.classList.remove('loading'), 200);
   }
-  const si = it.raw?.sourceInfo;
-  const scope = si?.scope === 'project' ? 'project' : 'user';
-  return { enable: false, resourceKind, path: it.path, scope };
+}
+
+async function cleanupSessions() {
+  const keep = state.currentSessionId;
+  if (!keep || !state.sessions.some((s) => s.id === keep)) { toast('Pick a captured session first'); return; }
+  const others = state.sessions.length - 1;
+  if (!others) { toast('Only one session. Nothing to delete.'); return; }
+  if (!(await confirmDialog(`Delete ${others} other snapshot${others === 1 ? '' : 's'} and keep only this session?`))) return;
+  const btn = $('cleanupSessionsBtn');
+  btn.classList.add('loading');
+  try {
+    const { removed = [] } = await postJson('/api/sessions/cleanup', { keep });
+    await loadSessions();
+    renderTopbar();
+    toast(removed.length ? `Deleted ${removed.length} snapshot${removed.length === 1 ? '' : 's'}` : 'Nothing to delete', 'success');
+  } catch (e) {
+    toast(`Delete failed: ${e.message}`, 'error');
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+
+async function share() {
+  if (!state.snapshot) { toast('No snapshot to share'); return; }
+  const btn = $('shareBtn');
+  btn.classList.add('loading');
+  try {
+    const url = window.piShare.buildShareUrl(await window.piShare.encodeSnapshot(state.snapshot));
+    await navigator.clipboard.writeText(url);
+    toast(`Share link copied (${Math.max(1, Math.round(url.length / 1024))} KB). Home paths are hidden.`, 'success');
+  } catch (e) {
+    toast(`Share failed: ${e.message}`, 'error');
+  } finally {
+    btn.classList.remove('loading');
+  }
 }
 //#endregion
 
@@ -637,275 +779,180 @@ function bindResize() {
   handle.addEventListener('mousedown', () => {
     dragging = true;
     handle.classList.add('is-dragging');
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
+    document.body.classList.add('resizing');
   });
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
-    const layout = panel.parentElement;
-    const rect = layout.getBoundingClientRect();
+    const rect = panel.parentElement.getBoundingClientRect();
     const w = Math.max(220, Math.min(rect.width - 280, e.clientX - rect.left));
-    panel.style.flex = `0 0 ${w}px`;
+    panel.style.flexBasis = `${w}px`;
     try { localStorage.setItem('inspect.sidebarW', String(w)); } catch {}
   });
   window.addEventListener('mouseup', () => {
     if (!dragging) return;
     dragging = false;
     handle.classList.remove('is-dragging');
-    document.body.style.cursor = '';
-    document.body.style.userSelect = '';
+    document.body.classList.remove('resizing');
   });
   try {
     const w = Number(localStorage.getItem('inspect.sidebarW'));
-    if (w >= 220) panel.style.flex = `0 0 ${w}px`;
+    if (w >= 220) panel.style.flexBasis = `${w}px`;
   } catch {}
 }
 
-function bindEvents() {
-  $('sessionSelect').addEventListener('change', async (e) => {
-    const id = e.target.value || null;
-    setUrlSession(id);
-    await loadSnapshot(id);
-    state.selected = null;
-    renderTopbar();
-    renderTree();
-    renderDetail();
-  });
-
-  $('kindFilter').addEventListener('change', (e) => {
-    state.kind = e.target.value;
-    renderTree();
-  });
-
-  $('searchInput').addEventListener('input', (e) => {
-    state.search = e.target.value;
-    renderTree();
-  });
-
-  $('shareBtn').addEventListener('click', async () => {
-    if (!state.snapshot) { toast('no snapshot to share'); return; }
-    if (!window.piShare) { toast('share module not loaded'); return; }
-    const btn = $('shareBtn');
-    btn.classList.add('loading');
-    try {
-      const encoded = await window.piShare.encodeSnapshot(state.snapshot);
-      const url = window.piShare.buildShareUrl(encoded);
-      await navigator.clipboard.writeText(url);
-      const kb = Math.max(1, Math.round(url.length / 1024));
-      toast(`Share link copied — ${kb} KB. Paths redacted to <home>.`);
-    } catch (e) {
-      toast(`Share failed: ${e.message}`);
-    } finally {
-      btn.classList.remove('loading');
-    }
-  });
-
-  $('refreshBtn').addEventListener('click', async () => {
-    const btn = $('refreshBtn');
-    btn.classList.add('loading');
-    await loadSessions();
-    await loadSnapshot(state.currentSessionId);
-    renderTopbar();
-    renderTree();
-    renderDetail();
-    setTimeout(() => btn.classList.remove('loading'), 200);
-    toast('refreshed');
-  });
-
-  $('cleanupSessionsBtn').addEventListener('click', async () => {
-    const keep = state.currentSessionId;
-    if (!keep) { toast('select a session first'); return; }
-    const others = state.sessions.filter((s) => s.id !== keep).length;
-    if (!others) { toast('only one session — nothing to remove'); return; }
-    if (!confirm(`Delete ${others} other snapshot${others === 1 ? '' : 's'} and keep only the selected session?`)) return;
-    const btn = $('cleanupSessionsBtn');
-    btn.classList.add('loading');
-    try {
-      const r = await fetch('/api/sessions/cleanup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keep }),
-      });
-      const data = await r.json();
-      if (!r.ok || data.ok === false) throw new Error(data.error || `HTTP ${r.status}`);
-      const n = data.removed?.length ?? 0;
-      await loadSessions();
-      renderTopbar();
-      toast(n ? `removed ${n} session${n === 1 ? '' : 's'}` : 'nothing to remove');
-    } catch (e) {
-      toast(`cleanup failed: ${e.message}`);
-    } finally {
-      btn.classList.remove('loading');
-    }
-  });
-
-  $('themeBtn').addEventListener('click', () => {
-    document.body.classList.toggle('light');
-    try {
-      localStorage.setItem('inspect.theme', document.body.classList.contains('light') ? 'light' : 'dark');
-    } catch {}
-  });
-
-  $('expandToggle').addEventListener('click', () => {
-    state.expandAll = !state.expandAll;
-    for (const k of KIND_ORDER) state.expanded[k] = state.expandAll;
-    const subKeys = new Set(Object.keys(state.expanded).filter((k) => k.includes('::')));
-    for (const it of buildItems()) subKeys.add(`${it.kind}::${it.source || '(unknown)'}`);
-    for (const key of subKeys) {
-      if (state.expandAll) delete state.expanded[key];
-      else state.expanded[key] = false;
-    }
-    $('expandToggle').textContent = state.expandAll ? 'Collapse all' : 'Expand all';
-    renderTree();
-  });
-
-  window.addEventListener('popstate', async () => {
-    await loadSnapshot(getUrlSession());
-    renderTopbar();
-    renderTree();
-    renderDetail();
-  });
-
-  window.addEventListener('keydown', handleKeydown);
-
-  document.addEventListener('selectionchange', () => {
-    const sel = document.getSelection();
-    if (!sel || sel.isCollapsed) return;
-    const node = sel.anchorNode;
-    const host = node?.nodeType === 1 ? node : node?.parentElement;
-    const row = host?.closest?.('.tree-row[data-item]');
-    if (!row) return;
-    const id = row.dataset.item;
-    const root = $('treeContainer');
-    const idx = Array.prototype.indexOf.call(root.children, row);
-    if (idx >= 0) state.highlight = idx;
-    if (state.selected !== id) {
-      state.selected = id;
-      renderTree();
-      renderDetail();
-    }
-    row.scrollIntoView({ block: 'nearest' });
-  });
-
-  $('shortcutsBtn').addEventListener('click', showHelpModal);
-  $('helpCloseBtn').addEventListener('click', hideHelpModal);
-  $('helpModal').addEventListener('click', (e) => {
-    if (e.target === $('helpModal')) hideHelpModal();
-  });
-}
-
-function moveHighlight(delta) {
-  const rows = state.visibleRows;
-  if (!rows.length) return;
-  const prev = state.highlight;
-  let idx = prev;
-  if (idx < 0) {
-    const selIdx = state.selected ? rows.findIndex((r) => r.type === 'item' && r.key === state.selected) : -1;
-    if (selIdx >= 0) idx = Math.max(0, Math.min(rows.length - 1, selIdx + delta));
-    else idx = delta > 0 ? 0 : rows.length - 1;
-  } else idx = Math.max(0, Math.min(rows.length - 1, idx + delta));
-  if (idx === prev) return;
-  state.highlight = idx;
-  const root = $('treeContainer');
-  if (prev >= 0) root.children[prev]?.classList.remove('focused');
-  const el = root.children[idx];
-  if (el) {
-    el.classList.add('focused');
-    el.scrollIntoView({ block: 'nearest' });
-  }
-}
-
-function activateHighlight() {
-  const r = state.visibleRows[state.highlight];
-  if (!r) return;
-  const root = $('treeContainer');
-  const el = root.children[state.highlight];
-  if (el) el.click();
-}
-
-function expandAtHighlight(open) {
-  const r = state.visibleRows[state.highlight];
-  if (!r) return;
-  if (r.type === 'group') {
-    state.expanded[r.key] = open;
-    renderTree();
-  } else if (r.type === 'subgroup') {
-    if (open) delete state.expanded[r.key];
-    else state.expanded[r.key] = false;
-    renderTree();
-  } else if (r.type === 'item' && !open) {
-    for (let i = state.highlight - 1; i >= 0; i--) {
-      if (state.visibleRows[i].type === 'group' || state.visibleRows[i].type === 'subgroup') {
-        state.highlight = i;
-        renderTree();
-        break;
-      }
-    }
-  }
-}
-
-function showHelpModal() { $('helpModal').classList.add('open'); }
-function hideHelpModal() { $('helpModal').classList.remove('open'); }
-function isHelpOpen() { return $('helpModal')?.classList.contains('open'); }
+const KEYMAP = {
+  '?': () => setModal('helpModal', true),
+  '/': () => $('searchInput').focus(),
+  s: () => { if (!$('sessionSelect').disabled) $('sessionSelect').focus(); },
+  r: refresh,
+  t: toggleTheme,
+  e: toggleExpandAll,
+  j: () => moveHighlight(1),
+  ArrowDown: () => moveHighlight(1),
+  k: () => moveHighlight(-1),
+  ArrowUp: () => moveHighlight(-1),
+  g: () => setHighlight(0),
+  Home: () => setHighlight(0),
+  G: () => setHighlight(state.visibleRows.length - 1),
+  End: () => setHighlight(state.visibleRows.length - 1),
+  l: () => expandAtHighlight(true),
+  ArrowRight: () => expandAtHighlight(true),
+  h: () => expandAtHighlight(false),
+  ArrowLeft: () => expandAtHighlight(false),
+  Enter: () => activateRow(state.highlight),
+  ' ': () => activateRow(state.highlight),
+  o: () => clickDetailButton('openEditorBtn', 'This item has no file to open'),
+  c: () => clickDetailButton('copyPathBtn', 'This item has no path'),
+  Escape: closeDetail,
+};
+CHIP_KINDS.forEach((k, i) => { KEYMAP[String(i)] = () => setKind(k); });
 
 function handleKeydown(e) {
-  if (isHelpOpen()) {
-    if (e.key === 'Escape' || e.key === '?') {
-      e.preventDefault();
-      hideHelpModal();
-    }
+  if (isOpen('confirmModal')) {
+    if (e.key === 'Escape') { e.preventDefault(); settleConfirm(false); }
+    else if (e.key === 'Tab') trapTab(e, ['confirmCancel', 'confirmOk']);
     return;
   }
+  if (isOpen('helpModal')) {
+    if (e.key === 'Escape' || e.key === '?') { e.preventDefault(); setModal('helpModal', false); }
+    return;
+  }
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
   const tag = e.target?.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-    if (e.key === 'Escape') {
-      e.target.blur();
-      e.preventDefault();
-    }
+    if (e.key === 'Escape') { e.preventDefault(); e.target.blur(); $('treeContainer').focus(); }
+    else if (e.key === 'Enter' && tag === 'INPUT') { e.preventDefault(); $('treeContainer').focus(); moveHighlight(1); }
     return;
   }
-  if (e.key === '?') { e.preventDefault(); showHelpModal(); return; }
-  if (matchKey(e, '/')) { e.preventDefault(); $('searchInput').focus(); return; }
-  if (matchKey(e, 'f', 'F')) { e.preventDefault(); $('kindFilter').focus(); return; }
-  if (matchKey(e, 'r', 'R')) { e.preventDefault(); $('refreshBtn').click(); return; }
-  if (matchKey(e, 't', 'T')) { e.preventDefault(); $('themeBtn').click(); return; }
-  if (matchKey(e, 'e', 'E')) { e.preventDefault(); $('expandToggle').click(); return; }
-  if (matchKey(e, 'j', 'ArrowDown')) { e.preventDefault(); moveHighlight(1); return; }
-  if (matchKey(e, 'k', 'ArrowUp')) { e.preventDefault(); moveHighlight(-1); return; }
-  if (matchKey(e, 'l', 'ArrowRight')) { e.preventDefault(); expandAtHighlight(true); return; }
-  if (matchKey(e, 'h', 'ArrowLeft')) { e.preventDefault(); expandAtHighlight(false); return; }
-  if (matchKey(e, 'Enter', ' ', 'Space')) { e.preventDefault(); activateHighlight(); return; }
-  if (e.key === 'Escape') {
-    if (state.selected) { state.selected = null; renderTree(); renderDetail(); }
-  }
+  if ((tag === 'BUTTON' || tag === 'A') && (e.key === 'Enter' || e.key === ' ')) return;
+  const action = KEYMAP[e.key];
+  if (!action) return;
+  e.preventDefault();
+  action();
+}
+
+function bindEvents() {
+  $('sessionSelect').addEventListener('change', (e) => switchSession(e.target.value || null));
+  $('kindChips').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-kind]');
+    if (chip) setKind(chip.dataset.kind);
+  });
+  $('searchInput').addEventListener('input', (e) => {
+    state.search = e.target.value;
+    state.highlight = -1;
+    renderTree();
+  });
+  $('treeContainer').addEventListener('click', (e) => {
+    const row = e.target.closest('.tree-row');
+    if (row) activateRow(Number(row.dataset.index));
+  });
+  $('shareBtn').addEventListener('click', share);
+  $('refreshBtn').addEventListener('click', refresh);
+  $('cleanupSessionsBtn').addEventListener('click', cleanupSessions);
+  $('themeBtn').addEventListener('click', toggleTheme);
+  $('expandToggle').addEventListener('click', toggleExpandAll);
+  $('shortcutsBtn').addEventListener('click', () => setModal('helpModal', true));
+  $('helpCloseBtn').addEventListener('click', () => setModal('helpModal', false));
+  $('helpModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) setModal('helpModal', false); });
+  $('confirmOk').addEventListener('click', () => settleConfirm(true));
+  $('confirmCancel').addEventListener('click', () => settleConfirm(false));
+  $('confirmModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) settleConfirm(false); });
+  window.addEventListener('popstate', () => switchSession(getUrlSession(), { push: false }));
+  window.addEventListener('keydown', handleKeydown);
 }
 
 function bindSse() {
   const es = new EventSource('/api/events');
-  es.addEventListener('snapshot', async () => {
+  es.addEventListener('snapshot', async (ev) => {
+    let files = null;
+    try { files = JSON.parse(ev.data).files; } catch {}
+    const id = state.currentSessionId;
+    // Same rule as sanitize() in lib/snapshot.js, which names the snapshot files.
+    const ownFile = id && `${id.replace(/[^a-zA-Z0-9._-]/g, '_')}.json`;
+    if (!ownFile || !Array.isArray(files) || files.includes(ownFile)) return reload();
     await loadSessions();
-    await loadSnapshot(state.currentSessionId);
     renderTopbar();
-    renderTree();
-    renderDetail();
   });
   es.addEventListener('navigate', async (ev) => {
     try {
       const { session } = JSON.parse(ev.data);
-      const sid = session || (state.sessions[0] && state.sessions[0].id);
+      const sid = session || state.sessions[0]?.id;
       if (!sid) return;
-      const u = new URL(window.location.href);
-      u.searchParams.set('session', sid);
-      window.history.replaceState({}, '', u);
-      state.currentSessionId = sid;
-      await loadSnapshot(sid);
-      renderTopbar();
-      renderTree();
-      renderDetail();
-      try { window.focus(); } catch {}
+      setUrlSession(sid, true);
+      await switchSession(sid, { push: false });
+      window.focus();
     } catch {}
   });
-  es.onerror = () => {};
+}
+//#endregion
+
+//#region THEME
+// Companion embed contract with a framing host (the pi-kanban board): with ?embed=1 the dashboard
+// posts `pi-companion:ready` to its parent, and the parent answers with `pi-companion:theme`
+// ({ mode, colors }) then and on each theme change. The theme is not saved.
+const EMBEDDED = window.parent !== window && new URLSearchParams(location.search).get('embed') === '1';
+const THEME_KEY = 'inspect.theme';
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+const THEME_KEYS = [
+  'bgDeep', 'bgSurface', 'bgElevated', 'bgHover', 'border',
+  'textPrimary', 'textSecondary', 'textTertiary', 'textMuted',
+  'accent', 'accentText', 'success', 'warning', 'error',
+];
+const cssVar = (key) => `--${key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
+
+function savedTheme() {
+  if (EMBEDDED) return null;
+  try { return localStorage.getItem(THEME_KEY); } catch { return null; }
+}
+
+function applyLocalTheme() {
+  const theme = savedTheme() ?? (darkQuery.matches ? 'dark' : 'light');
+  document.body.classList.toggle('light', theme === 'light');
+}
+
+function toggleTheme() {
+  if (EMBEDDED) return;
+  const light = document.body.classList.toggle('light');
+  try { localStorage.setItem(THEME_KEY, light ? 'light' : 'dark'); } catch {}
+}
+
+function applyHostTheme({ mode, colors }) {
+  document.body.classList.toggle('light', mode === 'light');
+  for (const key of THEME_KEYS) {
+    const v = colors?.[key];
+    if (typeof v === 'string' && CSS.supports('color', v)) document.body.style.setProperty(cssVar(key), v);
+  }
+}
+
+applyLocalTheme();
+if (EMBEDDED) {
+  document.body.classList.add('embedded');
+  window.addEventListener('message', (e) => {
+    if (e.source === window.parent && e.data?.type === 'pi-companion:theme') applyHostTheme(e.data);
+  });
+  window.parent.postMessage({ type: 'pi-companion:ready' }, '*');
+} else {
+  darkQuery.addEventListener('change', () => { if (!savedTheme()) applyLocalTheme(); });
 }
 //#endregion
 
@@ -923,35 +970,19 @@ async function loadSharedSnapshot() {
     return true;
   } catch (e) {
     console.warn('Failed to decode shared snapshot:', e);
-    toast(`shared link decode failed: ${e.message}`, 'error');
+    toast(`Cannot read the share link: ${e.message}`, 'error');
     return false;
   }
 }
 
-function applyStaticModeUi() {
-  document.body.classList.add('static-mode');
-  for (const id of ['sessionSelect', 'cleanupSessionsBtn', 'refreshBtn']) {
-    const el = $(id);
-    if (el) el.style.display = 'none';
-  }
-  const share = $('shareBtn');
-  if (share) share.title = 'Re-copy this shared snapshot link';
-}
-
 (async function init() {
-  try {
-    if (localStorage.getItem('inspect.theme') === 'light') document.body.classList.add('light');
-  } catch {}
-
   bindResize();
   bindEvents();
 
-  const sharedLoaded = await loadSharedSnapshot();
-  if (!sharedLoaded) {
+  if (!(await loadSharedSnapshot())) {
     try {
-      await loadSessions();
       const requested = getUrlSession();
-      await loadSnapshot(requested);
+      await Promise.all([loadSessions(), loadSnapshot(requested)]);
       if (state.currentSessionId && !requested) setUrlSession(state.currentSessionId, true);
     } catch {
       state.staticMode = true;
@@ -959,16 +990,9 @@ function applyStaticModeUi() {
     }
   }
 
-  if (state.staticMode) applyStaticModeUi();
-
-  if (state.snapshot?.systemPrompt) {
-    const firstCtx = buildItems().find((x) => x.kind === 'context');
-    if (firstCtx) state.selected = firstCtx.id;
-  }
-
-  renderTopbar();
-  renderTree();
-  renderDetail();
+  if (state.staticMode) document.body.classList.add('static-mode');
+  state.selected = defaultSelection();
+  renderAll();
   if (!state.staticMode) bindSse();
 })();
 //#endregion
