@@ -3,6 +3,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	statSync,
 	unlinkSync,
@@ -11,7 +12,6 @@ import {
 	type FSWatcher,
 } from "node:fs";
 import { createConnection } from "node:net";
-import { homedir } from "node:os";
 import {
 	dirname,
 	join as joinPath,
@@ -22,6 +22,9 @@ import { fileURLToPath } from "node:url";
 import {
 	DefaultPackageManager,
 	type ExtensionAPI,
+	type ExtensionContext,
+	getAgentDir,
+	type PackageSource,
 	parseFrontmatter,
 	type ResolvedResource,
 	SettingsManager,
@@ -31,7 +34,8 @@ const extDir = fileURLToPath(new URL(".", import.meta.url));
 const port = 5462;
 const url = `http://localhost:${port}`;
 
-const INSPECT_DIR = joinPath(homedir(), ".pi", "agent", "inspect");
+const AGENT_DIR = getAgentDir();
+const INSPECT_DIR = joinPath(AGENT_DIR, "inspect");
 const SNAP_DIR = joinPath(INSPECT_DIR, "snapshots");
 const INDEX_PATH = joinPath(SNAP_DIR, "index.json");
 const REQ_DIR = joinPath(INSPECT_DIR, "requests");
@@ -107,9 +111,16 @@ function readIndex(): IndexEntry[] {
 	}
 }
 
+// The dashboard server watches SNAP_DIR and reads files on change, so it must never see a half-written one.
+function writeJsonAtomic(file: string, value: unknown): void {
+	mkdirSync(dirname(file), { recursive: true });
+	const tmp = `${file}.${process.pid}.tmp`;
+	writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
+	renameSync(tmp, file);
+}
+
 function writeIndex(entries: IndexEntry[]): void {
-	mkdirSync(SNAP_DIR, { recursive: true });
-	writeFileSync(INDEX_PATH, JSON.stringify({ sessions: entries }, null, 2), "utf8");
+	writeJsonAtomic(INDEX_PATH, { sessions: entries });
 }
 
 function upsertIndex(entry: IndexEntry): void {
@@ -119,8 +130,7 @@ function upsertIndex(entry: IndexEntry): void {
 }
 
 function writeSnapshot(id: string, snapshot: unknown): void {
-	mkdirSync(SNAP_DIR, { recursive: true });
-	writeFileSync(joinPath(SNAP_DIR, `${sanitize(id)}.json`), JSON.stringify(snapshot, null, 2), "utf8");
+	writeJsonAtomic(joinPath(SNAP_DIR, `${sanitize(id)}.json`), snapshot);
 }
 
 type DisabledKind = "command" | "prompt" | "skill" | "extension" | "theme";
@@ -139,7 +149,6 @@ type DisabledItem = {
 	baseDir: string;
 };
 
-const AGENT_DIR = joinPath(homedir(), ".pi", "agent");
 const SETTINGS_PATH = joinPath(AGENT_DIR, "settings.json");
 
 type ResourceKind = "skills" | "prompts" | "extensions" | "themes";
@@ -308,22 +317,15 @@ async function processToggleRequest(req: ToggleRequest, sessionCwd: string): Pro
 		const baseDir = md.baseDir ?? dirname(target.path);
 		const pattern = relativePath(baseDir, target.path);
 		const settings = scope === "project" ? sm.getProjectSettings() : sm.getGlobalSettings();
-		const packages = [...(settings.packages ?? [])];
+		const packages: PackageSource[] = [...(settings.packages ?? [])];
 		const idx = packages.findIndex((p) => (typeof p === "string" ? p : p.source) === md.source);
 		if (idx < 0) throw new Error(`package not found in settings: ${md.source}`);
-		let pkg = packages[idx];
-		if (typeof pkg === "string") {
-			pkg = { source: pkg };
-			packages[idx] = pkg;
-		}
-		const arrayKey = req.resourceKind as keyof typeof pkg & ("extensions" | "skills" | "prompts" | "themes");
-		const current = ((pkg as any)[arrayKey] as string[] | undefined) ?? [];
-		const updated = applyPattern(current, pattern, enabled);
-		(pkg as any)[arrayKey] = updated.length > 0 ? updated : undefined;
-		const hasFilters = (["extensions", "skills", "prompts", "themes"] as const).some(
-			(k) => (pkg as any)[k] !== undefined,
-		);
-		if (!hasFilters) packages[idx] = (pkg as any).source;
+		const found = packages[idx];
+		const pkg = typeof found === "string" ? { source: found } : { ...found };
+		const updated = applyPattern(pkg[req.resourceKind] ?? [], pattern, enabled);
+		pkg[req.resourceKind] = updated.length > 0 ? updated : undefined;
+		const hasFilters = RESOURCE_KINDS.some((k) => pkg[k] !== undefined);
+		packages[idx] = hasFilters ? pkg : pkg.source;
 		if (scope === "project") sm.setProjectPackages(packages);
 		else sm.setPackages(packages);
 		await sm.flush();
@@ -334,19 +336,18 @@ async function processToggleRequest(req: ToggleRequest, sessionCwd: string): Pro
 	const baseDir = scope === "project" ? joinPath(sessionCwd, ".pi") : AGENT_DIR;
 	const pattern = relativePath(baseDir, target.path);
 	const settings = scope === "project" ? sm.getProjectSettings() : sm.getGlobalSettings();
-	const current = ((settings as any)[req.resourceKind] as string[] | undefined) ?? [];
-	const updated = applyPattern(current, pattern, enabled);
-	const setters: Record<ResourceKind, { user: string; project: string }> = {
-		skills:     { user: "setSkillPaths",          project: "setProjectSkillPaths" },
-		prompts:    { user: "setPromptTemplatePaths", project: "setProjectPromptTemplatePaths" },
-		extensions: { user: "setExtensionPaths",      project: "setProjectExtensionPaths" },
-		themes:     { user: "setThemePaths",          project: "setProjectThemePaths" },
+	const updated = applyPattern(settings[req.resourceKind] ?? [], pattern, enabled);
+	const setters: Record<ResourceKind, Record<DisabledScope, (paths: string[]) => void>> = {
+		skills:     { user: (p) => sm.setSkillPaths(p),          project: (p) => sm.setProjectSkillPaths(p) },
+		prompts:    { user: (p) => sm.setPromptTemplatePaths(p), project: (p) => sm.setProjectPromptTemplatePaths(p) },
+		extensions: { user: (p) => sm.setExtensionPaths(p),      project: (p) => sm.setProjectExtensionPaths(p) },
+		themes:     { user: (p) => sm.setThemePaths(p),          project: (p) => sm.setProjectThemePaths(p) },
 	};
-	(sm as any)[setters[req.resourceKind][scope]](updated);
+	setters[req.resourceKind][scope](updated);
 	await sm.flush();
 }
 
-let lastCtx: any = null;
+let lastCtx: ExtensionContext | null = null;
 let reqWatcher: FSWatcher | null = null;
 const recentlyHandled = new Set<string>();
 
@@ -365,7 +366,7 @@ async function handleRequestFile(full: string): Promise<void> {
 		return;
 	}
 
-	const cwd = lastCtx?.sessionManager?.getCwd?.() ?? process.cwd();
+	const cwd = lastCtx?.sessionManager.getCwd() ?? process.cwd();
 	try {
 		await processToggleRequest(req, cwd);
 		try { unlinkSync(full); } catch {}
@@ -391,7 +392,8 @@ function setupRequestWatcher(): void {
 	} catch {}
 	if (reqWatcher) return;
 	try {
-		reqWatcher = fsWatch(REQ_DIR, (_event, filename) => {
+		// libuv aborts the process on an event under a Windows 8.3 short path, so watch the long form.
+		reqWatcher = fsWatch(realpathSync.native(REQ_DIR), (_event, filename) => {
 			if (!filename) return;
 			const name = String(filename);
 			if (!name.endsWith(".json") || name.endsWith(".err.json")) return;
@@ -399,31 +401,27 @@ function setupRequestWatcher(): void {
 			try { statSync(full); } catch { return; }
 			void handleRequestFile(full);
 		});
+		// A live watcher keeps the event loop alive, so `pi -p` would never exit.
+		reqWatcher.unref();
 	} catch (e: any) {
 		console.warn(`pi-inspect: request watcher failed: ${e?.message ?? e}`);
 	}
 }
 
-async function captureSnapshot(ctx: any): Promise<{ id: string; entry: IndexEntry } | null> {
+async function captureSnapshot(ctx: ExtensionContext): Promise<{ id: string; entry: IndexEntry } | null> {
 	const sm = ctx.sessionManager;
-	const id = sm?.getSessionId?.();
-	if (!id) return null;
-	const cwd = sm?.getCwd?.() ?? null;
-	const name = sm?.getSessionName?.() ?? null;
-	const model = ctx.getModel?.()?.id ?? null;
-	const systemPrompt = typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : null;
-	const pi = piRef as any;
-	const commands = typeof pi?.getCommands === "function" ? pi.getCommands() : [];
-	const tools = typeof pi?.getAllTools === "function" ? pi.getAllTools() : [];
-	const activeTools = typeof pi?.getActiveTools === "function" ? pi.getActiveTools() : [];
+	const id = sm.getSessionId();
+	if (!id || !piRef) return null;
+	const cwd = sm.getCwd() ?? null;
+	const name = sm.getSessionName() ?? null;
+	const model = ctx.model?.id ?? null;
+	const systemPrompt = ctx.getSystemPrompt();
+	const commands = piRef.getCommands();
+	const tools = piRef.getAllTools();
+	const activeTools = piRef.getActiveTools();
 	const activePaths = new Set<string>();
-	for (const c of commands) {
-		const p = c?.sourceInfo?.path;
-		if (typeof p === "string") activePaths.add(p.replace(/\\/g, "/").toLowerCase());
-	}
-	for (const t of tools) {
-		const p = t?.sourceInfo?.path;
-		if (typeof p === "string") activePaths.add(p.replace(/\\/g, "/").toLowerCase());
+	for (const { sourceInfo } of [...commands, ...tools]) {
+		if (sourceInfo?.path) activePaths.add(sourceInfo.path.replace(/\\/g, "/").toLowerCase());
 	}
 	const { disabled: disabledItems, pending: pendingItems } = await discoverFromPackages(cwd, activePaths);
 	const capturedAt = Date.now();
@@ -442,8 +440,8 @@ async function startServer(notify: (m: string, l?: "info" | "error") => void): P
 	if (await probePort(port)) return true;
 	lastStderr = "";
 	const serverPath = resolvePath(extDir, "..", "server.js");
-	child = spawn(process.execPath, [serverPath], {
-		env: { ...process.env, PORT: String(port) },
+	child = spawn(process.execPath, [serverPath, "--port", String(port), "--no-open"], {
+		env: { ...process.env, PI_CODING_AGENT_DIR: AGENT_DIR },
 		stdio: ["ignore", "ignore", "pipe"],
 		detached: true,
 		windowsHide: true,
@@ -507,6 +505,10 @@ export default function inspectExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, ctx) => {
 		lastCtx = ctx;
 		await captureSnapshot(ctx);
+	});
+	pi.on("session_shutdown", () => {
+		reqWatcher?.close();
+		reqWatcher = null;
 	});
 
 	pi.registerCommand("inspect", {
